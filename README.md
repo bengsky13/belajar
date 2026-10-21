@@ -106,3 +106,38 @@ IHL disclosure. The fragmenter subsequently replaces the total-length,
 fragment-offset, and header-checksum bytes at offsets 2..3, 6..7, and 10..11;
 the probe verifies any surviving byte of an overlapping unaligned write and
 reports fully transient writes for kernel tracing or KASAN.
+
+## Disposable stale-options callback lab
+
+The `research-stale-options` branch contains a lab-only two-stage harness for
+the stale parsed-options write. Eight held and explicitly drained 3456-byte TAP
+frames seed a 32768-byte `task_frag` page. A safe `len=14` probe lets
+`tools/skbtrace` report the recycled short child's `head`; writing that address
+to `-stale-groom-head-file` releases a second `len=17` stage on the same locked
+kernel thread.
+
+For the Alpine 6.18.52 disposable VM, the second stage has been verified to:
+
+1. set `SKBFL_ZEROCOPY_ENABLE` in the reclaimed child's `skb_shared_info`;
+2. invoke a fake `ubuf_info->ops->complete` at the selected `strcpy` address;
+3. copy a NUL-free fake `subprocess_info` over the `sk_buff` prefix;
+4. force immediate skb rejection/free before the receive path reuses `skb->cb`;
+5. execute `call_usermodehelper_exec_async(skb)` and create a harmless marker
+   through `/bin/sh -c`.
+
+Resolve all callback addresses from the current lab boot—KASLR makes addresses
+copied from an earlier boot invalid:
+
+```sh
+awk '$3 == "strcpy" || $3 == "call_usermodehelper_exec_async" || \
+     $3 == "legacy_pic_irq_pending_noop" { print $1, $3 }' /proc/kallsyms
+```
+
+Use those values with `-stale-groom-callback`,
+`-stale-groom-umh-async`, and `-stale-groom-noop-ret`. The marker command is
+selected with `-stale-groom-command`. This direct async-helper invocation runs
+inside the TAP networking path and produces scheduling/RCU warnings in the
+instrumented lab, even though the marker is created and the process exits.
+It is not a completed Firecracker-host exploit: the real target still requires
+host text addresses and the host-side recycled head address without relying on
+guest BPF or `/proc/kallsyms`.

