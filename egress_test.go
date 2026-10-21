@@ -69,6 +69,31 @@ func TestIPv4OfDoubleVLANFrame(t *testing.T) {
 	}
 }
 
+func TestARPRequestAndReply(t *testing.T) {
+	guestMAC, _ := net.ParseMAC("02:00:00:00:00:02")
+	hostMAC, _ := net.ParseMAC("02:00:00:00:00:01")
+	guestClaim := net.ParseIP("192.0.2.3").To4()
+	hostIP := net.ParseIP("192.0.2.1").To4()
+	request := egressARPReply(hostMAC, guestMAC, hostIP, guestClaim)
+	binary.BigEndian.PutUint16(request[ethLen+6:ethLen+8], 1)
+	copy(request[0:6], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+	requesterMAC, requesterIP, ok := egressARPRequest(request, guestClaim)
+	if !ok || requesterMAC.String() != hostMAC.String() || !requesterIP.Equal(hostIP) {
+		t.Fatalf("request parse = %s %s %t", requesterMAC, requesterIP, ok)
+	}
+	reply := egressARPReply(guestMAC, requesterMAC, guestClaim, requesterIP)
+	if got := binary.BigEndian.Uint16(reply[12:14]); got != ethPArp {
+		t.Fatalf("reply ethertype = %#04x", got)
+	}
+	arp := reply[ethLen:]
+	if got := binary.BigEndian.Uint16(arp[6:8]); got != 2 {
+		t.Fatalf("reply opcode = %d", got)
+	}
+	if !net.IP(arp[14:18]).Equal(guestClaim) || !net.IP(arp[24:28]).Equal(hostIP) {
+		t.Fatalf("reply addresses sender=%s target=%s", net.IP(arp[14:18]), net.IP(arp[24:28]))
+	}
+}
+
 func TestUDPCarrierGeometry(t *testing.T) {
 	payload := bytesRepeat(4008, 0x11)
 	egressUDPHeaders(payload, 0x0101, 9)

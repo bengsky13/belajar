@@ -22,6 +22,17 @@ Repeated egress samples are sent as one batch and share a single capture window:
 ./test -egress -count 100 -egress-wait-ms 10000
 ```
 
+When external forwarding is unavailable, an unused address on the host-side TAP
+can provide a return path. Route the crafted datagram through the TAP gateway and
+add `-answer-dst-arp`; the probe answers the host's ARP request for `-dst`, then
+captures host-fragmented packets returned to the guest. This mode is explicit
+because it claims the destination address on that isolated link.
+
+```sh
+./test -egress -iface eth0 -dst 192.0.2.3 -gateway 192.0.2.1 \
+  -answer-dst-arp -count 10 -egress-wait-ms 15000
+```
+
 For a controlled external endpoint, `cmd/receiver` passively records the same
 mutated packets before the endpoint's IP stack handles them. It does not supply
 checksum-offload metadata and therefore does not exercise this vulnerability on

