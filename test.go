@@ -118,7 +118,6 @@ func verifyWrite(tap *os.File, cap *capture) error {
 	if len(got) == 0 {
 		return errors.New("verify: no fragment captured")
 	}
-		got[0][0], got[0][0]&0x0f, hex.EncodeToString(got[0][:min(20, len(got[0]))]))
 	if got[0][0] != 0x4f {
 		return fmt.Errorf("verify: wanted 0x4f, got 0x%02x", got[0][0])
 	}
