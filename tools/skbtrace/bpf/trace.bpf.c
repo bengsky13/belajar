@@ -92,7 +92,9 @@ enum event_kind {
 	EVENT_CSUM_EXIT = 3,
 };
 
-#define CORE_READ(obj, field) __builtin_preserve_access_index((obj)->field)
+#define CORE_READ_INTO(dst, obj, field)                                      \
+	bpf_probe_read_kernel((dst), sizeof(*(dst)),                           \
+			      __builtin_preserve_access_index(&(obj)->field))
 
 static __attribute__((always_inline)) int emit(struct sk_buff *skb, __u32 kind)
 {
@@ -107,10 +109,10 @@ static __attribute__((always_inline)) int emit(struct sk_buff *skb, __u32 kind)
 	if (!e)
 		return 0;
 
-	head = CORE_READ(skb, head);
-	data = CORE_READ(skb, data);
-	len = CORE_READ(skb, len);
-	data_len = CORE_READ(skb, data_len);
+	CORE_READ_INTO(&head, skb, head);
+	CORE_READ_INTO(&data, skb, data);
+	CORE_READ_INTO(&len, skb, len);
+	CORE_READ_INTO(&data_len, skb, data_len);
 	head_len = len - data_len;
 
 	e->kind = kind;
@@ -122,10 +124,10 @@ static __attribute__((always_inline)) int emit(struct sk_buff *skb, __u32 kind)
 	e->data_len = data_len;
 	e->head_len = head_len;
 	e->data_offset = (__u32)(data - head);
-	e->network_header = CORE_READ(skb, network_header);
-	e->transport_header = CORE_READ(skb, transport_header);
-	e->csum_start = CORE_READ(skb, csum_start);
-	e->csum_offset = CORE_READ(skb, csum_offset);
+	CORE_READ_INTO(&e->network_header, skb, network_header);
+	CORE_READ_INTO(&e->transport_header, skb, transport_header);
+	CORE_READ_INTO(&e->csum_start, skb, csum_start);
+	CORE_READ_INTO(&e->csum_offset, skb, csum_offset);
 	bpf_probe_read_kernel(e->packet, sizeof(e->packet), data);
 	bpf_probe_read_kernel(e->tail, sizeof(e->tail), data + head_len);
 	bpf_ringbuf_submit(e, 0);
