@@ -109,6 +109,10 @@ func parseCfg() cfg {
 		fmt.Fprintln(os.Stderr, "-count must be positive")
 		os.Exit(1)
 	}
+	if c.egress && c.count > 65536 {
+		fmt.Fprintln(os.Stderr, "egress -count must not exceed 65536 unique IPv4 IDs")
+		os.Exit(1)
+	}
 	if c.egressRest < 64 || c.head+c.egressRest > 65515 {
 		fmt.Fprintln(os.Stderr, "-egress-rest must produce an IPv4 datagram of 84..65535 bytes")
 		os.Exit(1)

@@ -18,6 +18,7 @@ import (
 const (
 	solPacket     = 263
 	packetVnetHdr = 15
+	soRcvbufForce = 33
 	ethPAll       = 0x0003
 	ipProtoICMP   = 1
 	ipProtoUDP    = 17
@@ -34,11 +35,18 @@ type egressRoute struct {
 }
 
 type egressCaptureStats struct {
-	txFragments int
-	icmpPackets int
-	quoted253   int
-	quotedUDP   int
-	matched     bool
+	txFragments    int
+	icmpPackets    int
+	quoted253      int
+	quotedUDP      int
+	matched        bool
+	matchedPackets int
+	matchedIDs     map[uint16]struct{}
+}
+
+type egressPrepared struct {
+	id      uint16
+	payload []byte
 }
 
 func runEgress(c cfg) error {
@@ -92,7 +100,8 @@ func runEgress(c cfg) error {
 		ifi.Name, ifi.MTU, src, ifi.HardwareAddr, dst, nextHop, nextMAC,
 		routeIPv4(route.dest), route.prefix, c.transport, c.head+c.egressRest, fragments)
 
-	seen := false
+	samples := make([]egressPrepared, 0, c.count)
+	expected := make(map[uint16]struct{}, c.count)
 	for sample := 0; sample < c.count; sample++ {
 		id := uint16(ipID + sample)
 		payload := make([]byte, c.head+c.egressRest)
@@ -109,18 +118,22 @@ func runEgress(c cfg) error {
 		if !egressSolve(payload, id, src, dst, proto) {
 			return fmt.Errorf("sample %d: solver found no 0x4f00 adjustment", sample)
 		}
-		if err := egressSendSequence(tx, ifi, ifi.HardwareAddr, nextMAC, src, dst, id, proto, payload, c.head, maxChunk); err != nil {
+		samples = append(samples, egressPrepared{id: id, payload: payload})
+		expected[id] = struct{}{}
+	}
+	for sample, prepared := range samples {
+		if err := egressSendSequence(tx, ifi, ifi.HardwareAddr, nextMAC, src, dst, prepared.id, proto, prepared.payload, c.head, maxChunk); err != nil {
 			return fmt.Errorf("sample %d: %w", sample, err)
 		}
-		stats, err := egressCollectICMP(rx, c.egressWait, id, dst, proto, c.head)
-		if err != nil {
-			return fmt.Errorf("sample %d capture: %w", sample, err)
-		}
-		fmt.Printf("capture: id=0x%04x tx_fragments=%d icmp=%d quoted_udp=%d quoted_proto253=%d matched=%t\n",
-			id, stats.txFragments, stats.icmpPackets, stats.quotedUDP, stats.quoted253, stats.matched)
-		seen = seen || stats.matched
 	}
-	if !seen {
+	stats, err := egressCollectICMP(rx, c.egressWait, expected, dst, proto, c.head)
+	if err != nil {
+		return fmt.Errorf("capture: %w", err)
+	}
+	fmt.Printf("capture: samples=%d tx_fragments=%d icmp=%d quoted_udp=%d quoted_proto253=%d matched_packets=%d matched_ids=%d\n",
+		len(samples), stats.txFragments, stats.icmpPackets, stats.quotedUDP, stats.quoted253,
+		stats.matchedPackets, len(stats.matchedIDs))
+	if !stats.matched {
 		return errors.New("no matching ICMP quotation received; confirm the destination emits protocol-unreachable ICMP or capture packets at the controlled endpoint")
 	}
 	return nil
@@ -300,6 +313,12 @@ func egressPacketSocket(ifindex int, vnet bool) (int, error) {
 		return -1, err
 	}
 	if !vnet {
+		// Batch mode can queue hundreds of outgoing observations and ICMP
+		// quotations before collection starts. Root in the guest normally has
+		// CAP_NET_ADMIN, so request a large buffer without depending on rmem_max.
+		if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, soRcvbufForce, 32<<20); err != nil {
+			_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4<<20)
+		}
 		_ = syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &syscall.Timeval{Usec: 10000})
 	}
 	return fd, nil
@@ -389,10 +408,10 @@ func egressFrame(ip []byte, src, dst net.HardwareAddr) []byte {
 	return f
 }
 
-func egressCollectICMP(fd int, wait time.Duration, id uint16, dst net.IP, proto byte, head int) (egressCaptureStats, error) {
+func egressCollectICMP(fd int, wait time.Duration, expected map[uint16]struct{}, dst net.IP, proto byte, head int) (egressCaptureStats, error) {
 	deadline := time.Now().Add(wait)
 	buf := make([]byte, 65536)
-	stats := egressCaptureStats{}
+	stats := egressCaptureStats{matchedIDs: make(map[uint16]struct{})}
 	for time.Now().Before(deadline) {
 		n, _, err := syscall.Recvfrom(fd, buf, 0)
 		if err != nil {
@@ -405,8 +424,11 @@ func egressCollectICMP(fd int, wait time.Duration, id uint16, dst net.IP, proto 
 		if len(outer) < ipLen {
 			continue
 		}
-		if outer[9] == proto && binary.BigEndian.Uint16(outer[4:]) == id {
-			stats.txFragments++
+		if outer[9] == proto {
+			outerID := binary.BigEndian.Uint16(outer[4:])
+			if _, ok := expected[outerID]; ok {
+				stats.txFragments++
+			}
 		}
 		if outer[9] != ipProtoICMP {
 			continue
@@ -435,16 +457,19 @@ func egressCollectICMP(fd int, wait time.Duration, id uint16, dst net.IP, proto 
 		}
 		quotedID := binary.BigEndian.Uint16(quoted[4:])
 		quotedDst := net.IP(quoted[16:20])
-		if quotedID != id || !quotedDst.Equal(dst) {
-			fmt.Printf("icmp-unmatched: type=%d code=%d quoted_id=0x%04x quoted_dst=%s expected_id=0x%04x expected_dst=%s\n",
-				icmp[0], icmp[1], quotedID, quotedDst, id, dst)
+		_, expectedID := expected[quotedID]
+		if !expectedID || !quotedDst.Equal(dst) {
+			fmt.Printf("icmp-unmatched: type=%d code=%d quoted_id=0x%04x quoted_dst=%s expected_dst=%s\n",
+				icmp[0], icmp[1], quotedID, quotedDst, dst)
 			continue
 		}
 		stats.matched = true
+		stats.matchedPackets++
+		stats.matchedIDs[quotedID] = struct{}{}
 		ihl := int(quoted[0]&0x0f) * 4
 		available := min(ihl, len(quoted))
 		fmt.Printf("icmp: type=%d code=%d id=0x%04x first=0x%02x ihl=%d quoted=%d\n",
-			icmp[0], icmp[1], id, quoted[0], ihl, len(quoted))
+			icmp[0], icmp[1], quotedID, quoted[0], ihl, len(quoted))
 		if available > ipLen {
 			options := quoted[ipLen:available]
 			fmt.Printf("  options %d bytes: %s\n", len(options), hex.EncodeToString(options))
