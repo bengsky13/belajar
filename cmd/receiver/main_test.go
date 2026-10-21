@@ -36,3 +36,34 @@ func TestIPv4OfDoubleVLAN(t *testing.T) {
 		t.Fatalf("ipv4Of() = %x", ip)
 	}
 }
+
+func TestCarrierExpectedTCP(t *testing.T) {
+	c := config{udpPort: 9, tcpPort: 443}
+	ip := make([]byte, ipLen+20)
+	ip[0] = 0x45
+	ip[9] = ipProtoTCP
+	binary.BigEndian.PutUint16(ip[ipLen+2:ipLen+4], 443)
+	if !carrierExpected(ip, ipLen, 0, c) {
+		t.Fatal("matching first TCP fragment was rejected")
+	}
+	binary.BigEndian.PutUint16(ip[ipLen+2:ipLen+4], 80)
+	if carrierExpected(ip, ipLen, 0, c) {
+		t.Fatal("wrong TCP destination port was accepted")
+	}
+	if !carrierExpected(ip[:ipLen], ipLen, 1, c) {
+		t.Fatal("nonzero-offset TCP fragment was rejected")
+	}
+	ip[9] = 99
+	if carrierExpected(ip, ipLen, 0, c) {
+		t.Fatal("unexpected protocol was accepted")
+	}
+}
+
+func TestKernelPointerCandidates(t *testing.T) {
+	leak := make([]byte, 32)
+	binary.LittleEndian.PutUint64(leak[10:18], 0xffff947485f7c500)
+	got := kernelPointerCandidates(leak)
+	if len(got) != 1 || got[0].offset != 10 || got[0].value != 0xffff947485f7c500 {
+		t.Fatalf("pointer candidates = %#v", got)
+	}
+}
