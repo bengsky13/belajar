@@ -31,3 +31,11 @@ the collector host:
 go build -o receiver ./cmd/receiver
 sudo ./receiver -iface eth0 -udp-port 9
 ```
+
+The local TAP/netns lab can also test other deferred IPv4 header mutations with
+`-csum-offset` (an even byte offset from 0 through 18) and `-csum-word` (the
+host-endian 16-bit value to write, except the unattainable one's-complement
+value `0xffff`). The default `0/0x004f` remains the verified IHL disclosure.
+The fragmenter subsequently replaces the total-length,
+fragment-offset, and header-checksum words at offsets 2, 6, and 10, so those
+transient mutations require kernel tracing or KASAN rather than packet capture.

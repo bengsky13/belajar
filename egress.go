@@ -115,14 +115,14 @@ func runEgress(c cfg) error {
 				payload[i] = marker
 			}
 		}
-		if !egressSolve(payload, id, src, dst, proto) {
-			return fmt.Errorf("sample %d: solver found no 0x4f00 adjustment", sample)
+		if !egressSolve(payload, id, src, dst, proto, c.csumOffset, uint16(c.csumWord)) {
+			return fmt.Errorf("sample %d: solver found no adjustment for checksum word 0x%04x", sample, c.csumWord)
 		}
 		samples = append(samples, egressPrepared{id: id, payload: payload})
 		expected[id] = struct{}{}
 	}
 	for sample, prepared := range samples {
-		if err := egressSendSequence(tx, ifi, ifi.HardwareAddr, nextMAC, src, dst, prepared.id, proto, prepared.payload, c.head, maxChunk); err != nil {
+		if err := egressSendSequence(tx, ifi, ifi.HardwareAddr, nextMAC, src, dst, prepared.id, proto, prepared.payload, c.head, maxChunk, c.csumOffset); err != nil {
 			return fmt.Errorf("sample %d: %w", sample, err)
 		}
 	}
@@ -324,29 +324,30 @@ func egressPacketSocket(ifindex int, vnet bool) (int, error) {
 	return fd, nil
 }
 
-func egressSendSequence(fd int, ifi *net.Interface, srcMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, id uint16, proto byte, payload []byte, head, maxChunk int) error {
+func egressSendSequence(fd int, ifi *net.Interface, srcMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, id uint16, proto byte, payload []byte, head, maxChunk, csumOffset int) error {
 	for offset := head; offset < len(payload); {
 		n := min(maxChunk, len(payload)-offset)
 		more := offset+n < len(payload)
 		ip := egressFragment(offset, more, payload[offset:offset+n], id, srcIP, dstIP, proto)
-		if err := egressSendFrame(fd, ifi.Index, dstMAC, egressFrame(ip, srcMAC, dstMAC), true, l2Len+ipLen); err != nil {
+		if err := egressSendFrame(fd, ifi.Index, dstMAC, egressFrame(ip, srcMAC, dstMAC), true, l2Len+ipLen, 0); err != nil {
 			return fmt.Errorf("send fragment offset=%d length=%d: %w", offset, n, err)
 		}
 		offset += n
 	}
 	first := egressFragment(0, true, payload[:head], id, srcIP, dstIP, proto)
-	if err := egressSendFrame(fd, ifi.Index, dstMAC, egressFrame(first, srcMAC, dstMAC), true, csumAtIP); err != nil {
+	if err := egressSendFrame(fd, ifi.Index, dstMAC, egressFrame(first, srcMAC, dstMAC), true, csumAtIP, uint16(csumOffset)); err != nil {
 		return fmt.Errorf("send head fragment: %w", err)
 	}
 	fmt.Printf("sent: id=0x%04x head=%d rest=%d adjustment=%02x%02x\n", id, head, len(payload)-head, payload[12], payload[13])
 	return nil
 }
 
-func egressSendFrame(fd, ifindex int, dstMAC net.HardwareAddr, frame []byte, checksum bool, start uint16) error {
+func egressSendFrame(fd, ifindex int, dstMAC net.HardwareAddr, frame []byte, checksum bool, start, offset uint16) error {
 	buf := make([]byte, 10+len(frame))
 	if checksum {
 		buf[0] = needsCsum
 		binary.LittleEndian.PutUint16(buf[6:], start)
+		binary.LittleEndian.PutUint16(buf[8:], offset)
 	}
 	copy(buf[10:], frame)
 	addr := &syscall.SockaddrLinklayer{Protocol: htons(vlanProto), Ifindex: ifindex, Halen: 6}
@@ -354,7 +355,7 @@ func egressSendFrame(fd, ifindex int, dstMAC net.HardwareAddr, frame []byte, che
 	return syscall.Sendto(fd, buf, 0, addr)
 }
 
-func egressSolve(payload []byte, id uint16, src, dst net.IP, proto byte) bool {
+func egressSolve(payload []byte, id uint16, src, dst net.IP, proto byte, csumOffset int, desired uint16) bool {
 	const adjust = 32
 	if adjust+1 >= ipLen+len(payload) {
 		return false
@@ -365,7 +366,7 @@ func egressSolve(payload []byte, id uint16, src, dst net.IP, proto byte) bool {
 		payload[off+1] = byte(word >> 8)
 		pkt := egressFragment(0, false, payload, id, src, dst, proto)
 		forwardTTL(pkt)
-		if csumFold(csumPartial(pkt)) == 0x004f {
+		if csumFold(csumPartial(pkt)) == desired {
 			return true
 		}
 	}

@@ -13,7 +13,7 @@ func TestEgressSolverAndFragments(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		payload[i] = marker
 	}
-	if !egressSolve(payload, ipID, src, dst, ipProtoRaw) {
+	if !egressSolve(payload, ipID, src, dst, ipProtoRaw, 0, 0x004f) {
 		t.Fatal("solver found no adjustment")
 	}
 	whole := egressFragment(0, false, payload, ipID, src, dst)
@@ -72,7 +72,7 @@ func TestIPv4OfDoubleVLANFrame(t *testing.T) {
 func TestUDPCarrierGeometry(t *testing.T) {
 	payload := bytesRepeat(4008, 0x11)
 	egressUDPHeaders(payload, 9)
-	if !egressSolve(payload, ipID, net.ParseIP("192.0.2.2"), net.ParseIP("198.51.100.7"), ipProtoUDP) {
+	if !egressSolve(payload, ipID, net.ParseIP("192.0.2.2"), net.ParseIP("198.51.100.7"), ipProtoUDP, 0, 0x004f) {
 		t.Fatal("UDP carrier solver found no adjustment")
 	}
 	whole := egressFragment(0, false, payload, ipID,
@@ -99,5 +99,30 @@ func TestUDPCarrierGeometry(t *testing.T) {
 	}
 	if payload[0] != 1 || payload[1] != 1 || payload[2] != 0 {
 		t.Fatalf("controlled options do not begin NOP,NOP,END: %x", payload[:3])
+	}
+}
+
+func TestDeferredChecksumWordSolver(t *testing.T) {
+	for _, desired := range []uint16{0x0000, 0x004f, 0x1234, 0x0001, 0xfffe} {
+		payload := bytesRepeat(300, 0x5a)
+		if !testo(payload, 0x2222, 0, desired) {
+			t.Fatalf("solver found no adjustment for %#04x", desired)
+		}
+		pkt := datagram(0x2222, payload)
+		forwardTTL(pkt)
+		if got := csumFold(csumPartial(pkt)); got != desired {
+			t.Fatalf("folded checksum = %#04x, want %#04x", got, desired)
+		}
+	}
+	payload := bytesRepeat(300, 0x5a)
+	if testo(payload, 0x2222, 0, 0xffff) {
+		t.Fatal("solver unexpectedly produced the unattainable 0xffff checksum for a nonempty packet")
+	}
+}
+
+func TestObservedIDAfterDeferredWrite(t *testing.T) {
+	c := cfg{csumOffset: 4, csumWord: 0x1234}
+	if got := observedID(c, 0x9999); got != 0x3412 {
+		t.Fatalf("observed ID = %#04x, want 0x3412", got)
 	}
 }

