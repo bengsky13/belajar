@@ -80,6 +80,7 @@ type cfg struct {
 	tcpSrcPort    int
 	tcpPort       int
 	tcpValid      bool
+	tcpEcho       bool
 	staleOptions  bool
 	staleOptSkip  int
 	staleOptLen   int
@@ -129,6 +130,7 @@ func parseCfg() cfg {
 	flag.IntVar(&c.tcpSrcPort, "tcp-source-port", 0x0100, "TCP source port (default bytes become NOP,END IPv4 options after mutation)")
 	flag.IntVar(&c.tcpPort, "tcp-port", 443, "destination port used by the TCP carrier")
 	flag.BoolVar(&c.tcpValid, "tcp-valid-checksum", false, "choose payload length and dual TCP checksums so TCP is valid before and after mutation")
+	flag.BoolVar(&c.tcpEcho, "tcp-echo-options", false, "encode a valid Timestamp option and recognize a TCP peer echoing the disclosed option bytes")
 	flag.BoolVar(&c.staleOptions, "stale-options-write", false, "lab-only: shrink a parsed 60-byte IPv4 header and exercise stale option processing on short frag_list children")
 	flag.IntVar(&c.staleOptSkip, "stale-option-skip", 0, "lab-only: copied option bytes before the stale non-copied option (0 or 2..6)")
 	flag.IntVar(&c.staleOptLen, "stale-option-len", 40, "lab-only: bytes changed to IPOPT_NOOP by the stale option")
@@ -215,6 +217,10 @@ func parseCfg() cfg {
 	}
 	if c.tcpValid && (!c.egress || c.transport != "tcp") {
 		fmt.Fprintln(os.Stderr, "-tcp-valid-checksum requires -egress -egress-transport tcp")
+		os.Exit(1)
+	}
+	if c.tcpEcho && !c.tcpValid {
+		fmt.Fprintln(os.Stderr, "-tcp-echo-options requires -tcp-valid-checksum")
 		os.Exit(1)
 	}
 	if c.staleOptions && c.egress {

@@ -279,6 +279,70 @@ func TestTCPValidChecksumLengthVariesByDestination(t *testing.T) {
 	}
 }
 
+func TestTCPEchoOptionCarrierGeometry(t *testing.T) {
+	src := net.ParseIP("192.0.2.2").To4()
+	dst := net.ParseIP("160.79.104.10").To4()
+	payloadLen := egressTCPValidPayloadLen(src, dst, 0x004f)
+	payload := bytesRepeat(payloadLen, 0x11)
+	egressTCPHeaders(payload, tcpEchoSrcPort, 443)
+	egressTCPEchoOptions(payload)
+	egressTCPChecksums(payload, src, dst)
+
+	for index, header := range [][]byte{payload[:20], payload[40:60]} {
+		if got := binary.BigEndian.Uint16(header[0:2]); got != tcpEchoSrcPort {
+			t.Fatalf("TCP header %d source port = %#04x, want %#04x", index, got, tcpEchoSrcPort)
+		}
+		if got := binary.BigEndian.Uint16(header[2:4]); got != 443 {
+			t.Fatalf("TCP header %d destination port = %d, want 443", index, got)
+		}
+		if got := header[4:8]; string(got) != string([]byte{0x44, 36, 37, 0}) {
+			t.Fatalf("TCP header %d sequence/option = %x", index, got)
+		}
+	}
+	if got := payload[:8]; string(got) != string([]byte{0x88, 0x04, 0x01, 0xbb, 0x44, 36, 37, 0}) {
+		t.Fatalf("post-mutation option prefix = %x", got)
+	}
+	if got := tcpIPv4Checksum(src, dst, payload); got != 0 {
+		t.Fatalf("pre-mutation TCP checksum residual = %#04x", got)
+	}
+	if got := tcpIPv4Checksum(src, dst, payload[40:]); got != 0 {
+		t.Fatalf("post-mutation TCP checksum residual = %#04x", got)
+	}
+	pkt := egressFragment(0, false, payload, ipID, src, dst, ipProtoTCP)
+	forwardTTL(pkt)
+	if got := csumFold(csumPartial(pkt)); got != 0x004f {
+		t.Fatalf("echo carrier deferred checksum = %#04x, want 0x004f", got)
+	}
+}
+
+func TestTCPEchoLeakParser(t *testing.T) {
+	local := net.ParseIP("192.0.2.2").To4()
+	remote := net.ParseIP("160.79.104.10").To4()
+	want := make([]byte, 32)
+	for i := range want {
+		want[i] = byte(i + 1)
+	}
+	options := append([]byte{0x44, 36, 37, 0x10}, want...)
+	ip := make([]byte, ipLen+len(options)+20)
+	ip[0] = 0x4e // 20-byte IPv4 header plus 36 option bytes
+	ip[9] = ipProtoTCP
+	copy(ip[12:16], remote)
+	copy(ip[16:20], local)
+	copy(ip[ipLen:], options)
+	tcp := ip[ipLen+len(options):]
+	binary.BigEndian.PutUint16(tcp[0:2], 443)
+	binary.BigEndian.PutUint16(tcp[2:4], tcpEchoSrcPort)
+
+	got, ok := egressTCPEchoLeak(ip, local, remote, tcpEchoSrcPort, 443)
+	if !ok || string(got) != string(want) {
+		t.Fatalf("echo leak = %x, %t; want %x, true", got, ok, want)
+	}
+	binary.BigEndian.PutUint16(tcp[2:4], tcpEchoSrcPort+1)
+	if got, ok := egressTCPEchoLeak(ip, local, remote, tcpEchoSrcPort, 443); ok || got != nil {
+		t.Fatalf("wrong-port reply matched: %x, %t", got, ok)
+	}
+}
+
 func TestDeferredChecksumWordSolver(t *testing.T) {
 	for _, desired := range []uint16{0x0000, 0x004f, 0x1234, 0x0001, 0xfffe} {
 		payload := bytesRepeat(300, 0x5a)

