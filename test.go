@@ -50,6 +50,7 @@ type cfg struct {
 	rest       int
 	tebar      int
 	tebarFill  byte
+	capture    time.Duration
 	page       bool
 	skipVerify bool
 }
@@ -60,16 +61,22 @@ func parseCfg() cfg {
 	flag.IntVar(&c.rest, "rest", 400, "payload carried in the completing fragment")
 	flag.IntVar(&c.tebar, "tebar", 0, "same-sized frames to allocate immediately before the head skb")
 	fill := flag.Int("tebar-fill", 0xee, "byte stored in tebar frames")
+	captureMs := flag.Int("capture-ms", 800, "time to collect output fragments")
 	flag.BoolVar(&c.page, "page", false, "force a page_frag head (TUNSETSNDBUF=INT_MAX, nonblocking write)")
 	flag.BoolVar(&c.skipVerify, "skip-verify", false, "skip the single-datagram header rewrite check")
 	flag.Parse()
 	c.tebarFill = byte(*fill)
+	c.capture = time.Duration(*captureMs) * time.Millisecond
 	if c.head < 8 || c.head%8 != 0 || c.head > 40 {
 		fmt.Fprintln(os.Stderr, "-head must be a multiple of 8 in 8..40")
 		os.Exit(1)
 	}
 	if c.rest < 16 {
 		fmt.Fprintln(os.Stderr, "-rest must be at least 16")
+		os.Exit(1)
+	}
+	if c.capture <= 0 {
+		fmt.Fprintln(os.Stderr, "-capture-ms must be positive")
 		os.Exit(1)
 	}
 	return c
@@ -151,7 +158,7 @@ func bali(tap *os.File, cap *capture, c cfg) error {
 	if err := writeTap(tap, first, true, csumAtIP); err != nil {
 		return err
 	}
-	pkts := cap.collect(800*time.Millisecond, ipID)
+	pkts := cap.collect(c.capture, ipID)
 	if len(pkts) == 0 {
 		return errors.New("no fragment captured")
 	}
