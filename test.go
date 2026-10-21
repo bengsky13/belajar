@@ -49,27 +49,28 @@ func main() {
 }
 
 type cfg struct {
-	head       int
-	rest       int
-	tebar      int
-	tebarFill  byte
-	capture    time.Duration
-	count      int
-	page       bool
-	skipVerify bool
-	egress     bool
-	egressRest int
-	iface      string
-	dst        string
-	src        string
-	gateway    string
-	dstMAC     string
-	egressWait time.Duration
-	transport  string
-	udpSrcPort int
-	udpPort    int
-	csumOffset int
-	csumWord   uint
+	head         int
+	rest         int
+	tebar        int
+	tebarFill    byte
+	capture      time.Duration
+	count        int
+	page         bool
+	skipVerify   bool
+	egress       bool
+	egressRest   int
+	iface        string
+	dst          string
+	src          string
+	gateway      string
+	dstMAC       string
+	egressWait   time.Duration
+	answerDstARP bool
+	transport    string
+	udpSrcPort   int
+	udpPort      int
+	csumOffset   int
+	csumWord     uint
 }
 
 func parseCfg() cfg {
@@ -89,6 +90,7 @@ func parseCfg() cfg {
 	flag.StringVar(&c.src, "src", "", "source IPv4 override (default: interface address)")
 	flag.StringVar(&c.gateway, "gateway", "", "next-hop IPv4 override (default: /proc/net/route)")
 	flag.StringVar(&c.dstMAC, "dst-mac", "", "next-hop MAC override (default: /proc/net/arp)")
+	flag.BoolVar(&c.answerDstARP, "answer-dst-arp", false, "answer ARP for -dst so host-routed fragments hairpin back to this interface")
 	flag.StringVar(&c.transport, "egress-transport", "udp", "egress carrier: udp or raw253")
 	flag.IntVar(&c.udpSrcPort, "udp-source-port", 0x0101, "UDP source port (also the first two post-mutation IPv4 option bytes)")
 	flag.IntVar(&c.udpPort, "udp-port", 9, "closed destination port used by the UDP carrier")
@@ -498,22 +500,27 @@ func (c *capture) collect(d time.Duration, id uint16) [][]byte {
 }
 
 func ipv4Of(frame []byte) []byte {
-	if len(frame) < ethLen {
+	proto, payload := ethernetPayload(frame)
+	if proto != ipProtoEth || len(payload) < ipLen {
 		return nil
+	}
+	return payload
+}
+
+func ethernetPayload(frame []byte) (uint16, []byte) {
+	if len(frame) < ethLen {
+		return 0, nil
 	}
 	off := ethLen
-	proto := binary.BigEndian.Uint16(frame[12:])
+	proto := binary.BigEndian.Uint16(frame[12:14])
 	for proto == vlanProto {
 		if len(frame) < off+vlanLen {
-			return nil
+			return 0, nil
 		}
-		proto = binary.BigEndian.Uint16(frame[off+2:])
+		proto = binary.BigEndian.Uint16(frame[off+2 : off+4])
 		off += vlanLen
 	}
-	if proto != ipProtoEth || len(frame) < off+ipLen {
-		return nil
-	}
-	return frame[off:]
+	return proto, frame[off:]
 }
 
 func openTap(name string, page bool) (*os.File, error) {
