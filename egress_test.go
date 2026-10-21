@@ -222,6 +222,41 @@ func TestTCPCarrierGeometry(t *testing.T) {
 	}
 }
 
+func TestTCPValidChecksumGeometry(t *testing.T) {
+	src := net.ParseIP("192.0.2.2").To4()
+	dst := net.ParseIP("160.79.104.10").To4()
+	payloadLen := egressTCPValidPayloadLen(src, dst, 0x004f)
+	if payloadLen != 33949 {
+		t.Fatalf("valid TCP payload length = %d, want 33949", payloadLen)
+	}
+	payload := bytesRepeat(payloadLen, 0x11)
+	egressTCPHeaders(payload, 0x0100, 443)
+	egressTCPChecksums(payload, src, dst)
+	if got := tcpIPv4Checksum(src, dst, payload); got != 0 {
+		t.Fatalf("pre-mutation TCP checksum residual = %#04x", got)
+	}
+	if got := tcpIPv4Checksum(src, dst, payload[40:]); got != 0 {
+		t.Fatalf("post-mutation TCP checksum residual = %#04x", got)
+	}
+	if binary.BigEndian.Uint16(payload[16:18]) == 0 || binary.BigEndian.Uint16(payload[56:58]) == 0 {
+		t.Fatalf("TCP checksums were not populated: pre=%#04x post=%#04x",
+			binary.BigEndian.Uint16(payload[16:18]), binary.BigEndian.Uint16(payload[56:58]))
+	}
+	pkt := egressFragment(0, false, payload, ipID, src, dst, ipProtoTCP)
+	forwardTTL(pkt)
+	if got := csumFold(csumPartial(pkt)); got != 0x004f {
+		t.Fatalf("valid TCP deferred checksum = %#04x, want 0x004f", got)
+	}
+}
+
+func TestTCPValidChecksumLengthVariesByDestination(t *testing.T) {
+	src := net.ParseIP("192.0.2.2").To4()
+	dst := net.ParseIP("185.2.100.241").To4()
+	if got := egressTCPValidPayloadLen(src, dst, 0x004f); got != 28419 {
+		t.Fatalf("controlled-endpoint payload length = %d, want 28419", got)
+	}
+}
+
 func TestDeferredChecksumWordSolver(t *testing.T) {
 	for _, desired := range []uint16{0x0000, 0x004f, 0x1234, 0x0001, 0xfffe} {
 		payload := bytesRepeat(300, 0x5a)

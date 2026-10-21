@@ -75,6 +75,7 @@ type cfg struct {
 	udpPort      int
 	tcpSrcPort   int
 	tcpPort      int
+	tcpValid     bool
 	csumOffset   int
 	csumWord     uint
 }
@@ -106,6 +107,7 @@ func parseCfg() cfg {
 	flag.IntVar(&c.udpPort, "udp-port", 9, "closed destination port used by the UDP carrier")
 	flag.IntVar(&c.tcpSrcPort, "tcp-source-port", 0x0100, "TCP source port (default bytes become NOP,END IPv4 options after mutation)")
 	flag.IntVar(&c.tcpPort, "tcp-port", 443, "destination port used by the TCP carrier")
+	flag.BoolVar(&c.tcpValid, "tcp-valid-checksum", false, "choose payload length and dual TCP checksums so TCP is valid before and after mutation")
 	flag.IntVar(&c.csumOffset, "csum-offset", 0, "deferred checksum write offset from the IPv4 header start")
 	flag.UintVar(&c.csumWord, "csum-word", 0x004f, "desired host-endian 16-bit deferred checksum value")
 	egressWaitMs := flag.Int("egress-wait-ms", 5000, "time to collect ICMP quotations in egress mode")
@@ -169,6 +171,10 @@ func parseCfg() cfg {
 	}
 	if c.tcpSrcPort < 1 || c.tcpSrcPort > 65535 || c.tcpPort < 1 || c.tcpPort > 65535 {
 		fmt.Fprintln(os.Stderr, "-tcp-source-port and -tcp-port must be in 1..65535")
+		os.Exit(1)
+	}
+	if c.tcpValid && (!c.egress || c.transport != "tcp") {
+		fmt.Fprintln(os.Stderr, "-tcp-valid-checksum requires -egress -egress-transport tcp")
 		os.Exit(1)
 	}
 	if c.transport == "tcp" && ((!c.egress && c.head+c.rest < 60) || (c.egress && c.head+c.egressRest < 60)) {
