@@ -21,6 +21,12 @@ the controlled endpoint's passive AF_PACKET receiver observes fragments before
 the remote TCP stack validates it. `-dst-mac`, `-gateway`, and `-src` can be used
 when automatic discovery is unavailable.
 
+For the x86 page-fragment layout, keep the TCP carrier at its default
+`-vlan-tags 2`. Host TCP parsing pulls the remaining 12 bytes of the first TCP
+header into the linear head; those two tags leave two bytes of tailroom after
+that pull, exposing the `frag_list` pointer at reported past-linear offset 22.
+The disposable TAP lab reproduced a canonical pointer with this geometry.
+
 Repeated egress samples are sent as one batch and share a single capture window:
 
 ```sh
@@ -61,12 +67,13 @@ that predecessor before the malicious head is allocated.
 
 `-vlan-tags` controls the number of nested VID-0 tags (default 2). On the
 nonblocking TAP/page-fragment path used by Firecracker, five tags place the
-logical IP tail two bytes before `skb_shared_info` on x86. The resulting
-32-byte disclosure contains 30 bytes of live shared-info metadata, including
-the `frag_list` pointer. The probe reports canonical little-endian kernel
-pointers as `host-pointer-candidate` lines. The disposable Linux 6.18 lab
-verified tags 2 through 7; at Linux's `VLAN_MAX_DEPTH` of 8 the deferred
-checksum mutation was no longer preserved.
+raw/UDP carrier's logical IP tail two bytes before `skb_shared_info` on x86.
+For TCP, the 12-byte transport-header pull shifts the equivalent useful layout
+to two tags as described above. The disclosure then includes the live
+`frag_list` pointer. The probe reports canonical little-endian kernel pointers
+as `host-pointer-candidate` lines. The disposable Linux 6.18 lab verified tags
+2 through 7; at Linux's `VLAN_MAX_DEPTH` of 8 the deferred checksum mutation
+was no longer preserved.
 
 For a controlled external endpoint, `cmd/receiver` passively records the same
 mutated packets before the endpoint's IP stack handles them. It does not supply
