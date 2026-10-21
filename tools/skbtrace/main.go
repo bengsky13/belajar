@@ -40,6 +40,7 @@ type objects struct {
 	TraceIPDoFragment *ebpf.Program `ebpf:"trace_ip_do_fragment"`
 	TraceCsumEnter    *ebpf.Program `ebpf:"trace_csum_enter"`
 	TraceCsumExit     *ebpf.Program `ebpf:"trace_csum_exit"`
+	ActiveCsum        *ebpf.Map     `ebpf:"active_csum"`
 	Events            *ebpf.Map     `ebpf:"events"`
 }
 
@@ -52,6 +53,9 @@ func (o *objects) Close() {
 	}
 	if o.TraceCsumExit != nil {
 		o.TraceCsumExit.Close()
+	}
+	if o.ActiveCsum != nil {
+		o.ActiveCsum.Close()
 	}
 	if o.Events != nil {
 		o.Events.Close()
@@ -76,16 +80,24 @@ func main() {
 	}
 	defer objs.Close()
 
-	programs := []*ebpf.Program{objs.TraceIPDoFragment, objs.TraceCsumEnter, objs.TraceCsumExit}
-	links := make([]link.Link, 0, len(programs))
-	for _, program := range programs {
-		lnk, err := link.AttachTracing(link.TracingOptions{Program: program})
-		if err != nil {
-			log.Fatalf("attach %s: %v", program.String(), err)
-		}
-		links = append(links, lnk)
-		defer lnk.Close()
+	fragmentLink, err := link.KprobeMulti(objs.TraceIPDoFragment,
+		link.KprobeMultiOptions{Symbols: []string{"ip_do_fragment"}})
+	if err != nil {
+		log.Fatalf("attach ip_do_fragment kprobe-multi: %v", err)
 	}
+	defer fragmentLink.Close()
+	csumEnterLink, err := link.KprobeMulti(objs.TraceCsumEnter,
+		link.KprobeMultiOptions{Symbols: []string{"skb_checksum_help"}})
+	if err != nil {
+		log.Fatalf("attach skb_checksum_help kprobe-multi: %v", err)
+	}
+	defer csumEnterLink.Close()
+	csumExitLink, err := link.KretprobeMulti(objs.TraceCsumExit,
+		link.KprobeMultiOptions{Symbols: []string{"skb_checksum_help"}})
+	if err != nil {
+		log.Fatalf("attach skb_checksum_help kretprobe-multi: %v", err)
+	}
+	defer csumExitLink.Close()
 
 	reader, err := ringbuf.NewReader(objs.Events)
 	if err != nil {

@@ -8,7 +8,13 @@ typedef unsigned long long __u64;
 
 #define SEC(name) __attribute__((section(name), used))
 #define __uint(name, value) int (*name)[value]
+#define __type(name, value) value *name
+#define BPF_MAP_TYPE_HASH 1
 #define BPF_MAP_TYPE_RINGBUF 27
+#define BPF_ANY 0
+#define BPF_FUNC_map_lookup_elem 1
+#define BPF_FUNC_map_update_elem 2
+#define BPF_FUNC_map_delete_elem 3
 #define BPF_FUNC_get_current_pid_tgid 14
 #define BPF_FUNC_probe_read_kernel 113
 #define BPF_FUNC_ringbuf_reserve 131
@@ -16,6 +22,13 @@ typedef unsigned long long __u64;
 
 static __u64 (*bpf_get_current_pid_tgid)(void) =
 	(void *)BPF_FUNC_get_current_pid_tgid;
+static void *(*bpf_map_lookup_elem)(void *map, const void *key) =
+	(void *)BPF_FUNC_map_lookup_elem;
+static long (*bpf_map_update_elem)(void *map, const void *key,
+				    const void *value, __u64 flags) =
+	(void *)BPF_FUNC_map_update_elem;
+static long (*bpf_map_delete_elem)(void *map, const void *key) =
+	(void *)BPF_FUNC_map_delete_elem;
 static long (*bpf_probe_read_kernel)(void *dst, __u32 size,
 				      const void *unsafe_ptr) =
 	(void *)BPF_FUNC_probe_read_kernel;
@@ -34,6 +47,14 @@ struct sk_buff {
 	unsigned char *head;
 	unsigned char *data;
 } __attribute__((preserve_access_index));
+
+/* Stable x86-64 kprobe register layout. */
+struct pt_regs {
+	__u64 r15, r14, r13, r12, bp, bx;
+	__u64 r11, r10, r9, r8;
+	__u64 ax, cx, dx, si, di;
+	__u64 orig_ax, ip, cs, flags, sp, ss;
+};
 
 struct event {
 	__u32 kind;
@@ -57,6 +78,13 @@ struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 1 << 20);
 } events SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, __u64);
+	__type(value, __u64);
+} active_csum SEC(".maps");
 
 enum event_kind {
 	EVENT_IP_FRAGMENT = 1,
@@ -104,22 +132,32 @@ static __attribute__((always_inline)) int emit(struct sk_buff *skb, __u32 kind)
 	return 0;
 }
 
-SEC("fentry/ip_do_fragment")
-int trace_ip_do_fragment(__u64 *ctx)
+SEC("kprobe/ip_do_fragment")
+int trace_ip_do_fragment(struct pt_regs *ctx)
 {
-	return emit((struct sk_buff *)ctx[2], EVENT_IP_FRAGMENT);
+	return emit((struct sk_buff *)ctx->dx, EVENT_IP_FRAGMENT);
 }
 
-SEC("fentry/skb_checksum_help")
-int trace_csum_enter(__u64 *ctx)
+SEC("kprobe/skb_checksum_help")
+int trace_csum_enter(struct pt_regs *ctx)
 {
-	return emit((struct sk_buff *)ctx[0], EVENT_CSUM_ENTER);
+	__u64 key = bpf_get_current_pid_tgid();
+	__u64 skb = ctx->di;
+
+	bpf_map_update_elem(&active_csum, &key, &skb, BPF_ANY);
+	return emit((struct sk_buff *)skb, EVENT_CSUM_ENTER);
 }
 
-SEC("fexit/skb_checksum_help")
-int trace_csum_exit(__u64 *ctx)
+SEC("kretprobe/skb_checksum_help")
+int trace_csum_exit(struct pt_regs *ctx)
 {
-	return emit((struct sk_buff *)ctx[0], EVENT_CSUM_EXIT);
+	__u64 key = bpf_get_current_pid_tgid();
+	__u64 *skb = bpf_map_lookup_elem(&active_csum, &key);
+
+	if (skb)
+		emit((struct sk_buff *)*skb, EVENT_CSUM_EXIT);
+	bpf_map_delete_elem(&active_csum, &key);
+	return 0;
 }
 
 char LICENSE[] SEC("license") = "GPL";
