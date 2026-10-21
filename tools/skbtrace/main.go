@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -107,7 +108,7 @@ func main() {
 	for {
 		record, err := reader.Read()
 		if err != nil {
-			if err == ringbuf.ErrClosed {
+			if errors.Is(err, ringbuf.ErrClosed) || errors.Is(err, os.ErrClosed) {
 				return
 			}
 			log.Fatalf("read ring buffer: %v", err)
