@@ -15,3 +15,9 @@ UDP header after the IHL mutation, making a closed destination port return the
 quoted leak through ordinary UDP/NAT paths. Use `-egress-transport raw253` for
 the original experimental protocol carrier. `-dst-mac`, `-gateway`, and `-src`
 can be used when automatic discovery is unavailable.
+
+Repeated egress samples are sent as one batch and share a single capture window:
+
+```sh
+./test -egress -count 100 -egress-wait-ms 10000
+```
