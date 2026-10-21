@@ -13,7 +13,7 @@ func TestEgressSolverAndFragments(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		payload[i] = marker
 	}
-	if !egressSolve(payload, ipID, src, dst) {
+	if !egressSolve(payload, ipID, src, dst, ipProtoRaw) {
 		t.Fatal("solver found no adjustment")
 	}
 	whole := egressFragment(0, false, payload, ipID, src, dst)
@@ -66,5 +66,38 @@ func TestIPv4OfDoubleVLANFrame(t *testing.T) {
 	got := ipv4Of(egressFrame(want, srcMAC, dstMAC))
 	if len(got) != len(want) || string(got) != string(want) {
 		t.Fatalf("decoded IPv4 packet differs: got %x want %x", got, want)
+	}
+}
+
+func TestUDPCarrierGeometry(t *testing.T) {
+	payload := bytesRepeat(4008, 0x11)
+	egressUDPHeaders(payload, 9)
+	if !egressSolve(payload, ipID, net.ParseIP("192.0.2.2"), net.ParseIP("198.51.100.7"), ipProtoUDP) {
+		t.Fatal("UDP carrier solver found no adjustment")
+	}
+	whole := egressFragment(0, false, payload, ipID,
+		net.ParseIP("192.0.2.2"), net.ParseIP("198.51.100.7"), ipProtoUDP)
+	forwardTTL(whole)
+	if got := csumFold(csumPartial(whole)); got != 0x004f {
+		t.Fatalf("UDP folded deferred checksum = %#04x, want 0x004f", got)
+	}
+	if got := binary.BigEndian.Uint16(payload[0:2]); got != 0x0101 {
+		t.Fatalf("initial UDP source port = %#04x", got)
+	}
+	if got := binary.BigEndian.Uint16(payload[2:4]); got != 9 {
+		t.Fatalf("initial UDP destination port = %d", got)
+	}
+	if got := binary.BigEndian.Uint16(payload[4:6]); got != uint16(len(payload)) {
+		t.Fatalf("initial UDP length = %d, want %d", got, len(payload))
+	}
+	post := payload[mutatedIHL-ipLen:]
+	if got := binary.BigEndian.Uint16(post[2:4]); got != 9 {
+		t.Fatalf("post-mutation UDP destination port = %d", got)
+	}
+	if got := binary.BigEndian.Uint16(post[4:6]); got != uint16(len(post)) {
+		t.Fatalf("post-mutation UDP length = %d, want %d", got, len(post))
+	}
+	if payload[0] != 1 || payload[1] != 1 || payload[2] != 0 {
+		t.Fatalf("controlled options do not begin NOP,NOP,END: %x", payload[:3])
 	}
 }
