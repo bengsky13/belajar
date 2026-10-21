@@ -21,3 +21,13 @@ Repeated egress samples are sent as one batch and share a single capture window:
 ```sh
 ./test -egress -count 100 -egress-wait-ms 10000
 ```
+
+For a controlled external endpoint, `cmd/receiver` passively records the same
+mutated packets before the endpoint's IP stack handles them. It does not supply
+checksum-offload metadata and therefore does not exercise this vulnerability on
+the collector host:
+
+```sh
+go build -o receiver ./cmd/receiver
+sudo ./receiver -iface eth0 -udp-port 9
+```
