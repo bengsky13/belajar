@@ -57,3 +57,14 @@ func TestRouteEncoding(t *testing.T) {
 		t.Fatalf("route round trip = %s, want %s", got, ip)
 	}
 }
+
+func TestIPv4OfDoubleVLANFrame(t *testing.T) {
+	srcMAC, _ := net.ParseMAC("02:00:00:00:00:01")
+	dstMAC, _ := net.ParseMAC("02:00:00:00:00:02")
+	want := egressFragment(0, true, bytesRepeat(8, marker), ipID,
+		net.ParseIP("192.0.2.2"), net.ParseIP("198.51.100.7"))
+	got := ipv4Of(egressFrame(want, srcMAC, dstMAC))
+	if len(got) != len(want) || string(got) != string(want) {
+		t.Fatalf("decoded IPv4 packet differs: got %x want %x", got, want)
+	}
+}
