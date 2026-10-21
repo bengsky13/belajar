@@ -54,7 +54,7 @@ struct event {
 	__u16 csum_start;
 	__u16 csum_offset;
 	__u8 packet[64];
-	__u8 tail[64];
+	__u8 tail[128];
 };
 
 struct {

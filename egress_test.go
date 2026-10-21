@@ -179,6 +179,28 @@ func TestUDPCarrierMalformedTimestampOption(t *testing.T) {
 	}
 }
 
+func TestUDPShortBridgeLabGeometry(t *testing.T) {
+	payload := make([]byte, 24)
+	egressUDPHeaders(payload, 0x0101, 9)
+	if got := binary.BigEndian.Uint16(payload[0:2]); got != 0x0101 {
+		t.Fatalf("source port = %#x, want %#x", got, 0x0101)
+	}
+	if got := binary.BigEndian.Uint16(payload[2:4]); got != 9 {
+		t.Fatalf("destination port = %d, want 9", got)
+	}
+	if got := binary.BigEndian.Uint16(payload[4:6]); got != uint16(len(payload)) {
+		t.Fatalf("length = %d, want %d", got, len(payload))
+	}
+	if got := binary.BigEndian.Uint16(payload[6:8]); got != 0 {
+		t.Fatalf("checksum = %#x, want zero", got)
+	}
+	for i, b := range payload[8:] {
+		if b != 0 {
+			t.Fatalf("payload byte %d = %#x, want zero", i+8, b)
+		}
+	}
+}
+
 func TestTCPCarrierGeometry(t *testing.T) {
 	payload := bytesRepeat(4008, 0x11)
 	egressTCPHeaders(payload, 0x0100, 443)

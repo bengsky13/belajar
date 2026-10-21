@@ -34,7 +34,7 @@ type event struct {
 	CsumStart       uint16
 	CsumOffset      uint16
 	Packet          [64]byte
-	Tail            [64]byte
+	Tail            [128]byte
 }
 
 type objects struct {

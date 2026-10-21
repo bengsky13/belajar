@@ -179,6 +179,12 @@ func egressUDPHeaders(payload []byte, srcPort, dstPort uint16) {
 	// Before the checksum write, conntrack sees this ordinary UDP header at
 	// payload offset zero. A zero IPv4 UDP checksum is valid.
 	putUDPHeader(payload[:8], srcPort, dstPort, uint16(len(payload)))
+	if len(payload) < 48 {
+		// A deliberately short reassembly cannot carry the duplicate header.
+		// This geometry is useful only in a disposable bridge-fragment lab:
+		// after IHL grows to 60, the datagram is shorter than its new header.
+		return
+	}
 	// After IHL changes from 20 to 60, fragmentation skips 40 bytes of the
 	// original payload. This duplicate becomes the UDP header on the wire.
 	putUDPHeader(payload[40:48], srcPort, dstPort, uint16(len(payload)-40))
