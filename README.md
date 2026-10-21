@@ -13,8 +13,13 @@ fragments before the short malicious head, and listens for an ICMP quotation.
 Its default UDP carrier is valid before the deferred write and exposes a second
 UDP header after the IHL mutation, making a closed destination port return the
 quoted leak through ordinary UDP/NAT paths. Use `-egress-transport raw253` for
-the original experimental protocol carrier. `-dst-mac`, `-gateway`, and `-src`
-can be used when automatic discovery is unavailable.
+the original experimental protocol carrier. When policy only admits web-like
+traffic, `-egress-transport tcp -tcp-port 443` emits SYN-shaped TCP headers both
+before and after the IHL mutation. Its default source-port bytes become
+NOP,END IPv4 options after mutation. Its TCP checksum is intentionally invalid;
+the controlled endpoint's passive AF_PACKET receiver observes fragments before
+the remote TCP stack validates it. `-dst-mac`, `-gateway`, and `-src` can be used
+when automatic discovery is unavailable.
 
 Repeated egress samples are sent as one batch and share a single capture window:
 
@@ -70,7 +75,7 @@ the collector host:
 
 ```sh
 go build -o receiver ./cmd/receiver
-sudo ./receiver -iface eth0 -udp-port 9
+sudo ./receiver -iface eth0 -udp-port 9 -tcp-port 443
 ```
 
 The local TAP/netns lab can also test other deferred mutations with

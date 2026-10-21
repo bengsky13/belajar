@@ -179,6 +179,49 @@ func TestUDPCarrierMalformedTimestampOption(t *testing.T) {
 	}
 }
 
+func TestTCPCarrierGeometry(t *testing.T) {
+	payload := bytesRepeat(4008, 0x11)
+	egressTCPHeaders(payload, 0x0100, 443)
+	firstBefore := append([]byte(nil), payload[:20]...)
+	secondBefore := append([]byte(nil), payload[40:60]...)
+	adjustIP := egressAdjustmentIPOffset("tcp")
+	if adjustIP != 44 {
+		t.Fatalf("TCP adjustment IP offset = %d, want 44", adjustIP)
+	}
+	if !egressSolveAt(payload, ipID, net.ParseIP("192.0.2.2"), net.ParseIP("198.51.100.7"), ipProtoTCP, 0, 0x004f, adjustIP) {
+		t.Fatal("TCP carrier solver found no adjustment")
+	}
+	whole := egressFragment(0, false, payload, ipID,
+		net.ParseIP("192.0.2.2"), net.ParseIP("198.51.100.7"), ipProtoTCP)
+	forwardTTL(whole)
+	if got := csumFold(csumPartial(whole)); got != 0x004f {
+		t.Fatalf("TCP folded deferred checksum = %#04x, want 0x004f", got)
+	}
+	if string(payload[:20]) != string(firstBefore) {
+		t.Fatalf("initial TCP header changed: got %x want %x", payload[:20], firstBefore)
+	}
+	if string(payload[40:60]) != string(secondBefore) {
+		t.Fatalf("post-mutation TCP header changed: got %x want %x", payload[40:60], secondBefore)
+	}
+	for index, header := range [][]byte{payload[:20], payload[40:60]} {
+		if got := binary.BigEndian.Uint16(header[0:2]); got != 0x0100 {
+			t.Fatalf("TCP header %d source port = %d", index, got)
+		}
+		if got := binary.BigEndian.Uint16(header[2:4]); got != 443 {
+			t.Fatalf("TCP header %d destination port = %d", index, got)
+		}
+		if header[12]>>4 != 5 || header[13] != 0x02 {
+			t.Fatalf("TCP header %d data offset/flags = %x/%x", index, header[12]>>4, header[13])
+		}
+		if got := binary.BigEndian.Uint16(header[16:18]); got != 0 {
+			t.Fatalf("TCP header %d checksum = %#04x, want zero", index, got)
+		}
+	}
+	if payload[0] != 1 || payload[1] != 0 {
+		t.Fatalf("controlled options do not begin NOP,END: %x", payload[:2])
+	}
+}
+
 func TestDeferredChecksumWordSolver(t *testing.T) {
 	for _, desired := range []uint16{0x0000, 0x004f, 0x1234, 0x0001, 0xfffe} {
 		payload := bytesRepeat(300, 0x5a)
