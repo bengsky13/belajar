@@ -38,14 +38,14 @@ const (
 
 func main() {
 	if os.Geteuid() != 0 {
-		fmt.Fprintln(os.Stderr, "poc: must run as root inside the lab netns")
-		fmt.Fprintln(os.Stderr, "poc: see README.md")
+		fmt.Fprintln(os.Stderr, "must run as root inside the lab netns")
+		fmt.Fprintln(os.Stderr, "see README.md")
 		os.Exit(1)
 	}
 	cfg := parseCfg()
 	if err := run(cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "poc: %v\n", err)
-		fmt.Fprintln(os.Stderr, "poc: lab not ready; see README.md")
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		fmt.Fprintln(os.Stderr, "lab not ready; see README.md")
 		os.Exit(1)
 	}
 }
@@ -70,11 +70,11 @@ func parseCfg() cfg {
 	flag.Parse()
 	c.sprayFill = byte(*fill)
 	if c.head < 8 || c.head%8 != 0 || c.head > 40 {
-		fmt.Fprintln(os.Stderr, "poc: -head must be a multiple of 8 in 8..40")
+		fmt.Fprintln(os.Stderr, "-head must be a multiple of 8 in 8..40")
 		os.Exit(1)
 	}
 	if c.rest < 16 {
-		fmt.Fprintln(os.Stderr, "poc: -rest must be at least 16")
+		fmt.Fprintln(os.Stderr, "-rest must be at least 16")
 		os.Exit(1)
 	}
 	return c
