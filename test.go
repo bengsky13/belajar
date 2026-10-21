@@ -160,7 +160,6 @@ func leak(tap *os.File, cap *capture, c cfg) error {
 	var leaked, mutated bool
 	for i, ip := range pkts {
 		ihl := int(ip[0]&0x0f) * 4
-			i, ip[0], ihl, binary.BigEndian.Uint16(ip[2:]))
 		if ip[0] != 0x4f {
 			continue
 		}
