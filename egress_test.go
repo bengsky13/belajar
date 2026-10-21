@@ -71,7 +71,7 @@ func TestIPv4OfDoubleVLANFrame(t *testing.T) {
 
 func TestUDPCarrierGeometry(t *testing.T) {
 	payload := bytesRepeat(4008, 0x11)
-	egressUDPHeaders(payload, 9)
+	egressUDPHeaders(payload, 0x0101, 9)
 	if !egressSolve(payload, ipID, net.ParseIP("192.0.2.2"), net.ParseIP("198.51.100.7"), ipProtoUDP, 0, 0x004f) {
 		t.Fatal("UDP carrier solver found no adjustment")
 	}
@@ -99,6 +99,17 @@ func TestUDPCarrierGeometry(t *testing.T) {
 	}
 	if payload[0] != 1 || payload[1] != 1 || payload[2] != 0 {
 		t.Fatalf("controlled options do not begin NOP,NOP,END: %x", payload[:3])
+	}
+}
+
+func TestUDPCarrierMalformedTimestampOption(t *testing.T) {
+	payload := bytesRepeat(4008, 0x11)
+	egressUDPHeaders(payload, 0x4401, 53)
+	if payload[0] != 0x44 || payload[1] != 0x01 {
+		t.Fatalf("post-mutation option prefix = %x, want 4401", payload[:2])
+	}
+	if got := binary.BigEndian.Uint16(payload[2:4]); got != 53 {
+		t.Fatalf("pre-mutation destination port = %d, want 53", got)
 	}
 }
 

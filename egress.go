@@ -109,7 +109,7 @@ func runEgress(c cfg) error {
 			payload[i] = 0x11
 		}
 		if c.transport == "udp" {
-			egressUDPHeaders(payload, uint16(c.udpPort))
+			egressUDPHeaders(payload, uint16(c.udpSrcPort), uint16(c.udpPort))
 		} else {
 			for i := 0; i < c.head; i++ {
 				payload[i] = marker
@@ -139,13 +139,13 @@ func runEgress(c cfg) error {
 	return nil
 }
 
-func egressUDPHeaders(payload []byte, dstPort uint16) {
+func egressUDPHeaders(payload []byte, srcPort, dstPort uint16) {
 	// Before the checksum write, conntrack sees this ordinary UDP header at
 	// payload offset zero. A zero IPv4 UDP checksum is valid.
-	putUDPHeader(payload[:8], 0x0101, dstPort, uint16(len(payload)))
+	putUDPHeader(payload[:8], srcPort, dstPort, uint16(len(payload)))
 	// After IHL changes from 20 to 60, fragmentation skips 40 bytes of the
 	// original payload. This duplicate becomes the UDP header on the wire.
-	putUDPHeader(payload[40:48], 0x0101, dstPort, uint16(len(payload)-40))
+	putUDPHeader(payload[40:48], srcPort, dstPort, uint16(len(payload)-40))
 }
 
 func putUDPHeader(dst []byte, srcPort, dstPort, length uint16) {
@@ -416,7 +416,7 @@ func egressCollectICMP(fd int, wait time.Duration, expected map[uint16]struct{},
 	for time.Now().Before(deadline) {
 		n, _, err := syscall.Recvfrom(fd, buf, 0)
 		if err != nil {
-			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EINTR) {
 				continue
 			}
 			return stats, err
