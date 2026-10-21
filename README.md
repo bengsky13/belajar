@@ -33,6 +33,36 @@ because it claims the destination address on that isolated link.
   -answer-dst-arp -count 10 -egress-wait-ms 15000
 ```
 
+To test whether the host immediately reuses a freed `skbuff_small_head` object
+for the malicious short fragment, insert one or more 128-byte experimental
+Ethernet frames directly before each head. Their payload is an obvious marker;
+if the returned `past-linear` window contains repeated `ee` bytes, the leak is
+showing controlled predecessor contents rather than unrelated allocator data:
+
+```sh
+./test -egress -iface eth0 -dst 192.0.2.3 -gateway 192.0.2.1 \
+  -answer-dst-arp -egress-spray 1 -egress-spray-fill 0xee \
+  -spray-delay-us 1000 -count 10 -egress-wait-ms 15000
+```
+
+The spray uses the locally administered experimental EtherType `0x88b5` and is
+disabled unless `-egress-spray` is nonzero.
+
+The prepared-TAP laboratory mode exposes the same experiment as
+`-tebar 1 -tebar-fill 0xee`. Unlike the original same-sized predecessor, the
+128-byte frame actually covers the 32-byte region disclosed past the short
+head's logical tail. `-spray-delay-us` gives the receive backlog time to free
+that predecessor before the malicious head is allocated.
+
+`-vlan-tags` controls the number of nested VID-0 tags (default 2). On the
+nonblocking TAP/page-fragment path used by Firecracker, five tags place the
+logical IP tail two bytes before `skb_shared_info` on x86. The resulting
+32-byte disclosure contains 30 bytes of live shared-info metadata, including
+the `frag_list` pointer. The probe reports canonical little-endian kernel
+pointers as `host-pointer-candidate` lines. The disposable Linux 6.18 lab
+verified tags 2 through 7; at Linux's `VLAN_MAX_DEPTH` of 8 the deferred
+checksum mutation was no longer preserved.
+
 For a controlled external endpoint, `cmd/receiver` passively records the same
 mutated packets before the endpoint's IP stack handles them. It does not supply
 checksum-offload metadata and therefore does not exercise this vulnerability on
