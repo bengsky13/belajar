@@ -66,6 +66,7 @@ type cfg struct {
 	dstMAC     string
 	egressWait time.Duration
 	transport  string
+	udpSrcPort int
 	udpPort    int
 	csumOffset int
 	csumWord   uint
@@ -89,6 +90,7 @@ func parseCfg() cfg {
 	flag.StringVar(&c.gateway, "gateway", "", "next-hop IPv4 override (default: /proc/net/route)")
 	flag.StringVar(&c.dstMAC, "dst-mac", "", "next-hop MAC override (default: /proc/net/arp)")
 	flag.StringVar(&c.transport, "egress-transport", "udp", "egress carrier: udp or raw253")
+	flag.IntVar(&c.udpSrcPort, "udp-source-port", 0x0101, "UDP source port (also the first two post-mutation IPv4 option bytes)")
 	flag.IntVar(&c.udpPort, "udp-port", 9, "closed destination port used by the UDP carrier")
 	flag.IntVar(&c.csumOffset, "csum-offset", 0, "deferred checksum write offset from the IPv4 header start")
 	flag.UintVar(&c.csumWord, "csum-word", 0x004f, "desired host-endian 16-bit deferred checksum value")
@@ -133,8 +135,8 @@ func parseCfg() cfg {
 		fmt.Fprintln(os.Stderr, "UDP egress transport requires -head 8")
 		os.Exit(1)
 	}
-	if c.udpPort < 1 || c.udpPort > 65535 {
-		fmt.Fprintln(os.Stderr, "-udp-port must be in 1..65535")
+	if c.udpSrcPort < 1 || c.udpSrcPort > 65535 || c.udpPort < 1 || c.udpPort > 65535 {
+		fmt.Fprintln(os.Stderr, "-udp-source-port and -udp-port must be in 1..65535")
 		os.Exit(1)
 	}
 	if c.csumOffset < 0 || c.csumOffset > ipLen-2 || c.csumOffset%2 != 0 {
@@ -244,7 +246,7 @@ func bali(tap *os.File, cap *capture, c cfg, verbose bool) ([][]byte, error) {
 	proto := byte(ipProtoRaw)
 	if c.transport == "udp" {
 		proto = ipProtoUDP
-		egressUDPHeaders(payload, uint16(c.udpPort))
+		egressUDPHeaders(payload, uint16(c.udpSrcPort), uint16(c.udpPort))
 	} else {
 		for i := 0; i < c.head; i++ {
 			payload[i] = marker
