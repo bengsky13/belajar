@@ -77,8 +77,8 @@ func parseCfg() cfg {
 }
 
 func run(c cfg) error {
-	tapName := getenv("PWN_TAP", "pwntap")
-	capName := getenv("PWN_CAP", "pwnv1")
+	tapName := getenv("PWN_TAP", "bengskytap")
+	capName := getenv("PWN_CAP", "bengskyv1")
 	if _, err := net.InterfaceByName(tapName); err != nil {
 		return fmt.Errorf("tap %s is not present: %w", tapName, err)
 	}
