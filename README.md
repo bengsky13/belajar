@@ -27,6 +27,19 @@ header into the linear head; those two tags leave two bytes of tailroom after
 that pull, exposing the `frag_list` pointer at reported past-linear offset 22.
 The disposable TAP lab reproduced a canonical pointer with this geometry.
 
+`-tcp-valid-checksum` makes both the original TCP segment and the segment that
+appears after the 40-byte IHL shift checksum-valid. It solves the payload length
+from the IPv4 TCP pseudo-header instead of modifying a scratch payload word;
+the resulting valid segment still makes the deferred host checksum store
+`0x4f00` into the first IPv4 word. This is useful when conntrack or egress policy
+drops the default deliberately invalid TCP checksum. The flag is egress-only
+and overrides `-egress-rest`.
+
+```sh
+./test -egress -egress-transport tcp -tcp-valid-checksum \
+  -tcp-port 443 -vlan-tags 2 -dst 185.2.100.241
+```
+
 Repeated egress samples are sent as one batch and share a single capture window:
 
 ```sh
