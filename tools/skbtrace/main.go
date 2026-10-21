@@ -37,25 +37,17 @@ type event struct {
 }
 
 type objects struct {
-	TraceIPDoFragment *ebpf.Program `ebpf:"trace_ip_do_fragment"`
-	TraceCsumEnter    *ebpf.Program `ebpf:"trace_csum_enter"`
-	TraceCsumExit     *ebpf.Program `ebpf:"trace_csum_exit"`
-	ActiveCsum        *ebpf.Map     `ebpf:"active_csum"`
-	Events            *ebpf.Map     `ebpf:"events"`
+	TraceNetDevQueue     *ebpf.Program `ebpf:"trace_net_dev_queue"`
+	TraceNetDevStartXmit *ebpf.Program `ebpf:"trace_net_dev_start_xmit"`
+	Events               *ebpf.Map     `ebpf:"events"`
 }
 
 func (o *objects) Close() {
-	if o.TraceIPDoFragment != nil {
-		o.TraceIPDoFragment.Close()
+	if o.TraceNetDevQueue != nil {
+		o.TraceNetDevQueue.Close()
 	}
-	if o.TraceCsumEnter != nil {
-		o.TraceCsumEnter.Close()
-	}
-	if o.TraceCsumExit != nil {
-		o.TraceCsumExit.Close()
-	}
-	if o.ActiveCsum != nil {
-		o.ActiveCsum.Close()
+	if o.TraceNetDevStartXmit != nil {
+		o.TraceNetDevStartXmit.Close()
 	}
 	if o.Events != nil {
 		o.Events.Close()
@@ -80,24 +72,20 @@ func main() {
 	}
 	defer objs.Close()
 
-	fragmentLink, err := link.KprobeMulti(objs.TraceIPDoFragment,
-		link.KprobeMultiOptions{Symbols: []string{"ip_do_fragment"}})
+	queueLink, err := link.AttachRawTracepoint(link.RawTracepointOptions{
+		Name: "net_dev_queue", Program: objs.TraceNetDevQueue,
+	})
 	if err != nil {
-		log.Fatalf("attach ip_do_fragment kprobe-multi: %v", err)
+		log.Fatalf("attach net_dev_queue raw tracepoint: %v", err)
 	}
-	defer fragmentLink.Close()
-	csumEnterLink, err := link.KprobeMulti(objs.TraceCsumEnter,
-		link.KprobeMultiOptions{Symbols: []string{"skb_checksum_help"}})
+	defer queueLink.Close()
+	xmitLink, err := link.AttachRawTracepoint(link.RawTracepointOptions{
+		Name: "net_dev_start_xmit", Program: objs.TraceNetDevStartXmit,
+	})
 	if err != nil {
-		log.Fatalf("attach skb_checksum_help kprobe-multi: %v", err)
+		log.Fatalf("attach net_dev_start_xmit raw tracepoint: %v", err)
 	}
-	defer csumEnterLink.Close()
-	csumExitLink, err := link.KretprobeMulti(objs.TraceCsumExit,
-		link.KprobeMultiOptions{Symbols: []string{"skb_checksum_help"}})
-	if err != nil {
-		log.Fatalf("attach skb_checksum_help kretprobe-multi: %v", err)
-	}
-	defer csumExitLink.Close()
+	defer xmitLink.Close()
 
 	reader, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
@@ -141,11 +129,9 @@ func main() {
 func kindName(kind uint32) string {
 	switch kind {
 	case 1:
-		return "ip_fragment"
+		return "net_dev_queue"
 	case 2:
-		return "csum_enter"
-	case 3:
-		return "csum_exit"
+		return "net_dev_start_xmit"
 	default:
 		return fmt.Sprintf("unknown_%d", kind)
 	}
