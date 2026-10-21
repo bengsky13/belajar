@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -15,17 +14,17 @@ import (
 )
 
 const (
-	iffTap      = 0x0002
-	iffNoPI     = 0x1000
-	iffVnetHdr  = 0x4000
-	tunSetIFF   = 0x400454ca
+	iffTap       = 0x0002
+	iffNoPI      = 0x1000
+	iffVnetHdr   = 0x4000
+	tunSetIFF    = 0x400454ca
 	tunSetSndBuf = 0x400454d4
-	needsCsum   = 1
+	needsCsum    = 1
 
 	ethLen     = 14
 	vlanLen    = 4
 	ipLen      = 20
-	l2Len      = ethLen + vlanLen + vlanLen 
+	l2Len      = ethLen + vlanLen + vlanLen
 	csumAtIP   = l2Len
 	vlanProto  = 0x8100
 	ipProtoEth = 0x0800
@@ -47,11 +46,11 @@ func main() {
 }
 
 type cfg struct {
-	head      int
-	rest      int
-	tebar     int
-	tebarFill byte
-	page      bool
+	head       int
+	rest       int
+	tebar      int
+	tebarFill  byte
+	page       bool
 	skipVerify bool
 }
 
@@ -118,6 +117,8 @@ func verifyWrite(tap *os.File, cap *capture) error {
 	if len(got) == 0 {
 		return errors.New("verify: no fragment captured")
 	}
+	fmt.Printf("verify: first byte 0x%02x ihl=%d hdr=%s\n",
+		got[0][0], got[0][0]&0x0f, hex.EncodeToString(got[0][:min(20, len(got[0]))]))
 	if got[0][0] != 0x4f {
 		return fmt.Errorf("verify: wanted 0x4f, got 0x%02x", got[0][0])
 	}
@@ -157,11 +158,14 @@ func bali(tap *os.File, cap *capture, c cfg) error {
 	var balied, mutated bool
 	for i, ip := range pkts {
 		ihl := int(ip[0]&0x0f) * 4
+		fmt.Printf("frag %d first=0x%02x ihl_bytes=%d tot=%d\n",
+			i, ip[0], ihl, binary.BigEndian.Uint16(ip[2:]))
 		if ip[0] != 0x4f {
 			continue
 		}
 		mutated = true
 		extra := ip[ipLen:ihl]
+		fmt.Printf("  options %d bytes: %s\n", len(extra), hex.EncodeToString(extra))
 		host := extra[c.head:]
 		nonzero := 0
 		for _, b := range host {
@@ -172,6 +176,8 @@ func bali(tap *os.File, cap *capture, c cfg) error {
 		if len(host) > 0 {
 			balied = true
 		}
+		fmt.Printf("  past-linear hex=%s ascii=%q nonzero=%d/%d\n",
+			hex.EncodeToString(host), string(host), nonzero, len(host))
 	}
 	switch {
 	case balied:
@@ -185,7 +191,7 @@ func bali(tap *os.File, cap *capture, c cfg) error {
 }
 
 func testo(payload []byte, id uint16) bool {
-	const adj = 32 
+	const adj = 32
 	if adj+1 >= ipLen+len(payload) {
 		return false
 	}
@@ -363,6 +369,8 @@ func printHead(c cfg) {
 	if c.page {
 		via = "page_frag skb (tun_build_skb)"
 	}
+	fmt.Printf("head: payload=%d frame=%d linear_after_strip=%d copy=60 past_headlen=%d via=%s tebar=%d fill=0x%02x\n",
+		c.head, frameLen, ipLen+c.head, past, via, c.tebar, c.tebarFill)
 }
 
 func ipChecksum(h []byte) uint16 {
