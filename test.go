@@ -139,8 +139,9 @@ func parseCfg() cfg {
 		fmt.Fprintln(os.Stderr, "-udp-source-port and -udp-port must be in 1..65535")
 		os.Exit(1)
 	}
-	if c.csumOffset < 0 || c.csumOffset > ipLen-2 || c.csumOffset%2 != 0 {
-		fmt.Fprintln(os.Stderr, "-csum-offset must be an even value in 0..18")
+	maxCsumOffset := ipLen + c.head - 2
+	if c.csumOffset < 0 || c.csumOffset > maxCsumOffset {
+		fmt.Fprintf(os.Stderr, "-csum-offset must be in 0..%d for -head %d\n", maxCsumOffset, c.head)
 		os.Exit(1)
 	}
 	if c.csumWord > 0xffff {
@@ -226,14 +227,15 @@ func verifyWrite(tap *os.File, cap *capture, c cfg) error {
 		return errors.New("verify: no fragment captured")
 	}
 	written := binary.LittleEndian.Uint16(got[0][c.csumOffset : c.csumOffset+2])
+	preserve := fragmentPreserveMask(c.csumOffset)
 	fmt.Printf("verify: csum_offset=%d wanted=0x%04x observed=0x%04x first=0x%02x ihl=%d hdr=%s\n",
 		c.csumOffset, c.csumWord, written, got[0][0], got[0][0]&0x0f,
 		hex.EncodeToString(got[0][:min(20, len(got[0]))]))
-	if !fragmenterRewritesWord(c.csumOffset) && written != uint16(c.csumWord) {
+	if (written & preserve) != (uint16(c.csumWord) & preserve) {
 		return fmt.Errorf("verify: wanted word 0x%04x at IP offset %d, got 0x%04x", c.csumWord, c.csumOffset, written)
 	}
-	if fragmenterRewritesWord(c.csumOffset) {
-		fmt.Println("verify: fragment construction rewrites this header word after checksum completion; use tracing/KASAN to observe the transient value")
+	if preserve != 0xffff {
+		fmt.Printf("verify: fragment construction rewrites mask 0x%04x after checksum completion; preserved mask 0x%04x matched\n", ^preserve, preserve)
 	}
 	return nil
 }
@@ -290,7 +292,8 @@ func bali(tap *os.File, cap *capture, c cfg, verbose bool) ([][]byte, error) {
 			continue
 		}
 		written := binary.LittleEndian.Uint16(ip[c.csumOffset : c.csumOffset+2])
-		if !fragmenterRewritesWord(c.csumOffset) && written != uint16(c.csumWord) {
+		preserve := fragmentPreserveMask(c.csumOffset)
+		if (written & preserve) != (uint16(c.csumWord) & preserve) {
 			continue
 		}
 		mutated = true
@@ -357,15 +360,31 @@ func testo(payload []byte, id uint16, csumOffset int, desired uint16) bool {
 	return false
 }
 
-func fragmenterRewritesWord(offset int) bool {
-	return offset == 2 || offset == 6 || offset == 10
+func fragmentPreserveMask(offset int) uint16 {
+	mask := uint16(0xffff)
+	for byteIndex := 0; byteIndex < 2; byteIndex++ {
+		absolute := offset + byteIndex
+		if (absolute >= 2 && absolute < 4) ||
+			(absolute >= 6 && absolute < 8) ||
+			(absolute >= 10 && absolute < 12) {
+			mask &^= 0xff << (8 * byteIndex)
+		}
+	}
+	return mask
 }
 
 func observedID(c cfg, original uint16) uint16 {
-	if c.csumOffset == 4 {
-		return htons(uint16(c.csumWord))
+	var id [2]byte
+	binary.BigEndian.PutUint16(id[:], original)
+	var written [2]byte
+	binary.LittleEndian.PutUint16(written[:], uint16(c.csumWord))
+	for i := 0; i < 2; i++ {
+		absolute := c.csumOffset + i
+		if absolute >= 4 && absolute < 6 {
+			id[absolute-4] = written[i]
+		}
 	}
-	return original
+	return binary.BigEndian.Uint16(id[:])
 }
 
 func datagram(id uint16, payload []byte) []byte {

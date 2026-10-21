@@ -132,8 +132,42 @@ func TestDeferredChecksumWordSolver(t *testing.T) {
 }
 
 func TestObservedIDAfterDeferredWrite(t *testing.T) {
-	c := cfg{csumOffset: 4, csumWord: 0x1234}
-	if got := observedID(c, 0x9999); got != 0x3412 {
-		t.Fatalf("observed ID = %#04x, want 0x3412", got)
+	tests := []struct {
+		offset int
+		word   uint
+		want   uint16
+	}{
+		{offset: 3, word: 0x1234, want: 0x1299},
+		{offset: 4, word: 0x1234, want: 0x3412},
+		{offset: 5, word: 0x1234, want: 0x9934},
+		{offset: 9, word: 0x0006, want: 0x9999},
+	}
+	for _, tt := range tests {
+		c := cfg{csumOffset: tt.offset, csumWord: tt.word}
+		if got := observedID(c, 0x9999); got != tt.want {
+			t.Errorf("offset %d observed ID = %#04x, want %#04x", tt.offset, got, tt.want)
+		}
+	}
+}
+
+func TestFragmentPreserveMask(t *testing.T) {
+	tests := map[int]uint16{
+		0:  0xffff,
+		1:  0x00ff,
+		2:  0x0000,
+		3:  0xff00,
+		5:  0x00ff,
+		6:  0x0000,
+		7:  0xff00,
+		9:  0x00ff,
+		10: 0x0000,
+		11: 0xff00,
+		12: 0xffff,
+		20: 0xffff,
+	}
+	for offset, want := range tests {
+		if got := fragmentPreserveMask(offset); got != want {
+			t.Errorf("offset %d mask = %#04x, want %#04x", offset, got, want)
+		}
 	}
 }
