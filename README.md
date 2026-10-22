@@ -387,6 +387,16 @@ Firecracker process: the target run must trigger fresh host NPT/EPT leaf faults
 using previously untouched guest-physical regions, identify the alias from
 inside the guest, and redirect it to host-sensitive memory before teardown.
 
+The tiny real-mode touch program is also portable to hardware Intel VMX/EPT.
+Its vCPUs install flat 4 GiB hidden limits for all six real-mode segments,
+because hardware VMX enforces the reset 64 KiB segment limits when the program
+uses 32-bit address-size overrides; the original QEMU TCG path was more
+permissive. `PWNESC_KVM_NPT_TEST=1` passes on the authorized Intel nested-KVM
+host after this fix. A first full eight-anchor EPT allocator run did not reclaim
+an EPT leaf: all stale windows retained their markers. The VM was force-stopped
+at the hold point. Thus vCPU execution is portable, but the AMD NPT allocation
+geometry is not yet demonstrated on Intel EPT and no EPT takeover is claimed.
+
 The egress form briefly raises the guest interface MTU to 65535, sends the
 jumbo descriptor seed followed by MTU-safe completing fragments, and restores
 the original MTU on every return path:

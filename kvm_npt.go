@@ -110,6 +110,20 @@ func kvmSimpleRequest(nr uintptr) uintptr {
 	return kvmIO<<8 | nr
 }
 
+func kvmSetFlatRealModeSegments(sregs *kvmSregs) {
+	for _, segment := range []*kvmSegment{&sregs.CS, &sregs.DS, &sregs.ES, &sregs.FS, &sregs.GS, &sregs.SS} {
+		segment.Base = 0
+		// The touch program runs with real-mode instruction defaults but uses
+		// 32-bit address-size overrides.  Hardware VMX enforces the hidden
+		// segment limit even when CR0.PE is clear, unlike the permissive TCG
+		// path used by the first NPT fixture.  Install flat unreal-mode data
+		// segments so sparse GPAs above 64 KiB are valid on both backends.
+		segment.Limit = ^uint32(0)
+		segment.Selector = 0
+		segment.G = 1
+	}
+}
+
 func newKVMVCPU(vmFD, id, runSize int) (*kvmVCPU, error) {
 	value, err := kvmIOCtl(vmFD, kvmSimpleRequest(kvmCreateVCPU), uintptr(id))
 	if err != nil {
@@ -125,10 +139,7 @@ func newKVMVCPU(vmFD, id, runSize int) (*kvmVCPU, error) {
 	if _, err := kvmIOCtl(fd, kvmIOC(iocRead, kvmGetSregsNR, unsafe.Sizeof(sregs)), uintptr(unsafe.Pointer(&sregs))); err != nil {
 		return nil, fmt.Errorf("KVM_GET_SREGS: %w", err)
 	}
-	for _, segment := range []*kvmSegment{&sregs.CS, &sregs.DS, &sregs.ES, &sregs.FS, &sregs.GS, &sregs.SS} {
-		segment.Base = 0
-		segment.Selector = 0
-	}
+	kvmSetFlatRealModeSegments(&sregs)
 	if _, err := kvmIOCtl(fd, kvmIOC(iocWrite, kvmSetSregsNR, unsafe.Sizeof(sregs)), uintptr(unsafe.Pointer(&sregs))); err != nil {
 		return nil, fmt.Errorf("KVM_SET_SREGS: %w", err)
 	}

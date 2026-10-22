@@ -306,6 +306,20 @@ func TestKVMNPTABIAndTouchProgram(t *testing.T) {
 	}
 }
 
+func TestKVMFlatRealModeSegments(t *testing.T) {
+	sregs := kvmSregs{}
+	kvmSetFlatRealModeSegments(&sregs)
+	for name, segment := range map[string]kvmSegment{
+		"cs": sregs.CS, "ds": sregs.DS, "es": sregs.ES,
+		"fs": sregs.FS, "gs": sregs.GS, "ss": sregs.SS,
+	} {
+		if segment.Base != 0 || segment.Limit != 0xffffffff || segment.Selector != 0 || segment.G != 1 {
+			t.Fatalf("%s segment base=%#x limit=%#x selector=%#x granularity=%d",
+				name, segment.Base, segment.Limit, segment.Selector, segment.G)
+		}
+	}
+}
+
 func TestKVMNPTProbeTouch(t *testing.T) {
 	if os.Getenv("PWNESC_KVM_NPT_TEST") != "1" {
 		t.Skip("set PWNESC_KVM_NPT_TEST=1 in a disposable nested-KVM fixture")
