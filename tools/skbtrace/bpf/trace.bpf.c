@@ -40,7 +40,14 @@ struct sk_buff {
 	unsigned char *data;
 } __attribute__((preserve_access_index));
 
-struct page;
+typedef struct {
+	int counter;
+} atomic_t;
+
+struct page {
+	atomic_t _refcount;
+} __attribute__((preserve_access_index));
+
 struct page_frag {
 	struct page *page;
 	__u32 offset;
@@ -72,10 +79,15 @@ struct event {
 	__u64 task_frag_page;
 	__u32 task_frag_offset;
 	__u32 task_frag_size;
+	int task_frag_refcount;
+	__u32 task_frag_pad;
 	__u16 network_header;
 	__u16 transport_header;
 	__u16 csum_start;
 	__u16 csum_offset;
+	__u64 page;
+	int page_refcount;
+	__u32 page_pad;
 	__u8 packet[64];
 	__u8 tail[128];
 	__u8 shinfo[96];
@@ -92,6 +104,7 @@ enum event_kind {
 	EVENT_NET_DEV_START_XMIT = 2,
 	EVENT_KFREE_SKB = 3,
 	EVENT_NETIF_RECEIVE_SKB = 4,
+	EVENT_PUT_PAGE = 5,
 };
 
 #define CORE_READ_INTO(dst, obj, field)                                      \
@@ -143,10 +156,18 @@ static __attribute__((always_inline)) int emit(struct sk_buff *skb, __u32 kind)
 	e->task_frag_page = (__u64)task_frag_page;
 	CORE_READ_INTO(&e->task_frag_offset, task, task_frag.offset);
 	CORE_READ_INTO(&e->task_frag_size, task, task_frag.size);
+	e->task_frag_refcount = 0;
+	e->task_frag_pad = 0;
+	if (task_frag_page)
+		CORE_READ_INTO(&e->task_frag_refcount, task_frag_page,
+			       _refcount.counter);
 	CORE_READ_INTO(&e->network_header, skb, network_header);
 	CORE_READ_INTO(&e->transport_header, skb, transport_header);
 	CORE_READ_INTO(&e->csum_start, skb, csum_start);
 	CORE_READ_INTO(&e->csum_offset, skb, csum_offset);
+	e->page = 0;
+	e->page_refcount = 0;
+	e->page_pad = 0;
 	bpf_probe_read_kernel(e->packet, sizeof(e->packet), data);
 	bpf_probe_read_kernel(e->tail, sizeof(e->tail), data + head_len);
 	bpf_probe_read_kernel(e->shinfo, sizeof(e->shinfo), head + end_offset);
@@ -177,6 +198,32 @@ SEC("raw_tracepoint/netif_receive_skb")
 int trace_netif_receive_skb(struct bpf_raw_tracepoint_args *ctx)
 {
 	return emit((struct sk_buff *)ctx->args[0], EVENT_NETIF_RECEIVE_SKB);
+}
+
+SEC("kprobe/put_page")
+int trace_put_page(void *ctx)
+{
+	struct event *e;
+	struct page *page;
+	__u64 pid_tgid;
+
+	/* x86-64 struct pt_regs.di is the first function argument. */
+	bpf_probe_read_kernel(&page, sizeof(page), (char *)ctx + 112);
+	if (!page)
+		return 0;
+
+	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	if (!e)
+		return 0;
+	__builtin_memset(e, 0, sizeof(*e));
+	pid_tgid = bpf_get_current_pid_tgid();
+	e->kind = EVENT_PUT_PAGE;
+	e->tgid = (__u32)(pid_tgid >> 32);
+	e->tid = (__u32)pid_tgid;
+	e->page = (__u64)page;
+	CORE_READ_INTO(&e->page_refcount, page, _refcount.counter);
+	bpf_ringbuf_submit(e, 0);
+	return 0;
 }
 
 char LICENSE[] SEC("license") = "GPL";

@@ -163,3 +163,27 @@ instrumented lab, even though the marker is created and the process exits.
 It is not a completed Firecracker-host exploit: the real target still requires
 host text addresses and the host-side recycled head address without relying on
 guest BPF or `/proc/kallsyms`.
+
+For an address-independent lab experiment, `-stale-groom-frag-page` seeds the
+reclaimed short child with one valid `skb_frag_t` using an observed, aligned
+`struct page` pointer.  With the current two-tag geometry and
+`-stale-option-skip 6 -stale-option-len 19`, stale option processing reaches
+exactly the first three `skb_shared_info` bytes: `flags`, `meta_len`, and
+`nr_frags`.  Leave `destructor_arg` zero.  Although the first byte enables the
+zerocopy flag, `skb_zcopy()` then returns NULL and normal fragment release sees
+the forged `nr_frags=1`.  This mode is only for proving the unmatched page
+reference decrement in the instrumented disposable kernel; a target chain must
+plant a genuine descriptor without supplying a host pointer.
+
+Use `-stale-groom-frag-page-file PATH` for the safer two-stage variant.  Its
+length-14 probe pauses on the same locked kernel thread; write the tracer's
+current `task_frag_page` value to `PATH`, and the length-19 stage seeds and
+reclaims a child from that still-live page-fragment cache.
+
+On Alpine's 6.18.52-0-virt kernel, the tracer observed the selected page at
+refcount 4 when the forged child reached `kfree_skb`, then at refcount 0 on the
+next same-thread event after the fragment SKBs were released.  The forged
+shared-info bytes contained `flags=1`, `nr_frags=1`, a zero `destructor_arg`,
+and the selected page in `frags[0]`.  This directly validates the extra page
+unref and dangling `task_frag.page` primitive in the disposable lab; it does
+not yet solve descriptor planting on the hosted target.

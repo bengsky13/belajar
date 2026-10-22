@@ -20,30 +20,35 @@ import (
 )
 
 type event struct {
-	Kind            uint32
-	TGID            uint32
-	TID             uint32
-	Pad             uint32
-	SKB             uint64
-	Head            uint64
-	Data            uint64
-	Len             uint32
-	DataLen         uint32
-	HeadLen         uint32
-	DataOffset      uint32
-	TailOffset      uint32
-	EndOffset       uint32
-	TaskFragPage    uint64
-	TaskFragOffset  uint32
-	TaskFragSize    uint32
-	NetworkHeader   uint16
-	TransportHeader uint16
-	CsumStart       uint16
-	CsumOffset      uint16
-	Packet          [64]byte
-	Tail            [128]byte
-	Shinfo          [96]byte
-	SKBObject       [96]byte
+	Kind             uint32
+	TGID             uint32
+	TID              uint32
+	Pad              uint32
+	SKB              uint64
+	Head             uint64
+	Data             uint64
+	Len              uint32
+	DataLen          uint32
+	HeadLen          uint32
+	DataOffset       uint32
+	TailOffset       uint32
+	EndOffset        uint32
+	TaskFragPage     uint64
+	TaskFragOffset   uint32
+	TaskFragSize     uint32
+	TaskFragRefcount int32
+	TaskFragPad      uint32
+	NetworkHeader    uint16
+	TransportHeader  uint16
+	CsumStart        uint16
+	CsumOffset       uint16
+	Page             uint64
+	PageRefcount     int32
+	PagePad          uint32
+	Packet           [64]byte
+	Tail             [128]byte
+	Shinfo           [96]byte
+	SKBObject        [96]byte
 }
 
 type objects struct {
@@ -51,6 +56,7 @@ type objects struct {
 	TraceNetDevStartXmit *ebpf.Program `ebpf:"trace_net_dev_start_xmit"`
 	TraceKfreeSKB        *ebpf.Program `ebpf:"trace_kfree_skb"`
 	TraceNetifReceiveSKB *ebpf.Program `ebpf:"trace_netif_receive_skb"`
+	TracePutPage         *ebpf.Program `ebpf:"trace_put_page"`
 	Events               *ebpf.Map     `ebpf:"events"`
 }
 
@@ -67,6 +73,9 @@ func (o *objects) Close() {
 	if o.TraceNetifReceiveSKB != nil {
 		o.TraceNetifReceiveSKB.Close()
 	}
+	if o.TracePutPage != nil {
+		o.TracePutPage.Close()
+	}
 	if o.Events != nil {
 		o.Events.Close()
 	}
@@ -75,6 +84,7 @@ func (o *objects) Close() {
 func main() {
 	objPath := flag.String("object", "trace.bpf.o", "compiled BPF object")
 	duration := flag.Duration("duration", 30*time.Second, "maximum trace duration")
+	putPage := flag.Bool("put-page", false, "attach the lab-only put_page kprobe")
 	flag.Parse()
 
 	if err := rlimit.RemoveMemlock(); err != nil {
@@ -118,6 +128,14 @@ func main() {
 		log.Fatalf("attach netif_receive_skb raw tracepoint: %v", err)
 	}
 	defer receiveLink.Close()
+	var putPageLink link.Link
+	if *putPage {
+		putPageLink, err = link.Kprobe("put_page", objs.TracePutPage, nil)
+		if err != nil {
+			log.Fatalf("attach put_page kprobe: %v", err)
+		}
+		defer putPageLink.Close()
+	}
 
 	reader, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
@@ -149,9 +167,14 @@ func main() {
 			log.Printf("decode event: %v", err)
 			continue
 		}
-		fmt.Printf("event=%s tgid=%d tid=%d skb=%#x head=%#x data=%#x len=%d data_len=%d head_len=%d data_off=%d tail=%d end=%d task_frag_page=%#x task_frag_off=%d task_frag_size=%d net=%d trans=%d csum_start=%d csum_offset=%d\n",
+		if ev.Kind == 5 {
+			fmt.Printf("event=put_page tgid=%d tid=%d page=%#x refcount_before=%d\n",
+				ev.TGID, ev.TID, ev.Page, ev.PageRefcount)
+			continue
+		}
+		fmt.Printf("event=%s tgid=%d tid=%d skb=%#x head=%#x data=%#x len=%d data_len=%d head_len=%d data_off=%d tail=%d end=%d task_frag_page=%#x task_frag_off=%d task_frag_size=%d task_frag_refcount=%d net=%d trans=%d csum_start=%d csum_offset=%d\n",
 			kindName(ev.Kind), ev.TGID, ev.TID, ev.SKB, ev.Head, ev.Data, ev.Len, ev.DataLen,
-			ev.HeadLen, ev.DataOffset, ev.TailOffset, ev.EndOffset, ev.TaskFragPage, ev.TaskFragOffset, ev.TaskFragSize, ev.NetworkHeader, ev.TransportHeader,
+			ev.HeadLen, ev.DataOffset, ev.TailOffset, ev.EndOffset, ev.TaskFragPage, ev.TaskFragOffset, ev.TaskFragSize, ev.TaskFragRefcount, ev.NetworkHeader, ev.TransportHeader,
 			ev.CsumStart, ev.CsumOffset)
 		fmt.Printf("  packet=%s\n", hex.EncodeToString(ev.Packet[:]))
 		fmt.Printf("  tail=%s\n", hex.EncodeToString(ev.Tail[:]))
@@ -170,6 +193,8 @@ func kindName(kind uint32) string {
 		return "kfree_skb"
 	case 4:
 		return "netif_receive_skb"
+	case 5:
+		return "put_page"
 	default:
 		return fmt.Sprintf("unknown_%d", kind)
 	}
