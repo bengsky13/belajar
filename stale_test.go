@@ -189,6 +189,25 @@ func TestStaleNaturalOverlapLocalReassemblyGeometry(t *testing.T) {
 	}
 }
 
+func TestStaleNaturalPCPPrimeGeometry(t *testing.T) {
+	c := cfg{}
+	applyStaleNaturalFrag(&c)
+	middle, head, tail := staleNaturalOverlapFramesForProto(c, ipID+5,
+		net.ParseIP("10.0.0.1").To4(), ipProtoPCP)
+	for name, frame := range map[string][]byte{"middle": middle, "head": head, "tail": tail} {
+		ip := ipv4Of(frame)
+		if ip == nil {
+			t.Fatalf("%s frame does not contain IPv4", name)
+		}
+		if got := ip[9]; got != ipProtoPCP {
+			t.Fatalf("%s protocol=%d, want %d", name, got, ipProtoPCP)
+		}
+		if got := net.IP(ip[16:20]); !got.Equal(net.ParseIP("10.0.0.1")) {
+			t.Fatalf("%s destination=%s, want 10.0.0.1", name, got)
+		}
+	}
+}
+
 func TestStaleNaturalLocalSingleRefGeometry(t *testing.T) {
 	c := cfg{}
 	applyStaleNaturalFrag(&c)
@@ -215,6 +234,16 @@ func TestStaleNaturalLocalSingleRefGeometry(t *testing.T) {
 	jumbo := staleNaturalJumboFragment(c, ipID+4, 8, 0x77)
 	if len(jumbo) != c.staleFragPadLen {
 		t.Fatalf("single-ref jumbo length=%d, want %d", len(jumbo), c.staleFragPadLen)
+	}
+}
+
+func TestPacketRingOrderZeroRequest(t *testing.T) {
+	req := packetRingRequest(64 << 20)
+	if req.BlockSize != 4096 || req.FrameSize != 4096 {
+		t.Fatalf("block_size=%d frame_size=%d, want order-0 pages", req.BlockSize, req.FrameSize)
+	}
+	if req.BlockNr != 16384 || req.FrameNr != req.BlockNr {
+		t.Fatalf("block_nr=%d frame_nr=%d, want 16384", req.BlockNr, req.FrameNr)
 	}
 }
 

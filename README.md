@@ -267,9 +267,46 @@ empty through verification.
 This mode intentionally leaves incomplete queues with stale descriptors and
 is only for a disposable VM that is shut down before their fragment timers
 expire.  It proves clean reallocation plus controlled read of a reused order-3
-page, not host command execution.  The next step is to replace the known-fill
-jumbo owner with a security-sensitive order-3 allocation and use the stale
-anchor's later release or disclosure against that object.
+page, not host command execution.
+
+The single-reference chain can now force that cleanly freed order-3 page
+through the per-CPU page cache into the buddy allocator, split it, reclaim its
+head as an order-0 `GFP_KERNEL` page, and read the new owner through the stale
+anchor. This is a destructive disposable-lab probe:
+
+```sh
+./test -stale-options-write -stale-natural-frag \
+  -stale-natural-overlap -stale-overlap-local-reassembly \
+  -stale-local-rollover 10 -stale-local-single-ref \
+  -stale-single-ref-anchors 8 \
+  -stale-single-ref-pcp-prime 1600 \
+  -stale-single-ref-pcp-wait-ms 2000 \
+  -stale-single-ref-packet-ring \
+  -stale-single-ref-ring-size $((64 << 20)) -capture-ms 100
+```
+
+The priming datagrams use local raw protocol 252. The target socket is closed
+first, making its page the oldest entry; releasing the completed priming batch
+then pushes the page past the exact 1 GiB test VM's adaptive PCP high watermark.
+Raw receive-queue destruction is deferred, so the grace interval precedes the
+order-0 allocation. `scripts/setup.sh` disables `ipfrag_max_dist` and extends
+`ipfrag_time` only inside the disposable namespace so the deliberately old
+anchor queues survive the 1,600 intervening fragmented datagrams.
+
+The allocator tracer observed target page `0xfffff0a3c00c7200` drain at order 3
+with refcount zero and later return from `mm_page_alloc` at order 0,
+migratetype 0, with the packet-ring GFP mask `0x52dc0`. In a clean run without
+the tracer, anchor zero disclosed 32 consecutive `0xb6` bytes written through
+the 64 MiB order-0 `PACKET_RX_RING`; the chain completed in 3.23 seconds. All
+31 main-package tests and 4 receiver tests passed, and `dmesg` remained free of
+bug, warning, bad-page, and refcount diagnostics through shutdown.
+
+This proves an order-3-to-order-0 UNMOVABLE transition and controlled read of
+the replacement kernel page. It is not host command execution. The remaining
+host-escape step is to replace the packet-ring owner with a useful host KVM
+allocation (most notably an EPT/NPT page-table page), identify the reclaimed
+page's role, and turn the stale read/release into controlled host translation
+or control flow.
 
 The egress form briefly raises the guest interface MTU to 65535, sends the
 jumbo descriptor seed followed by MTU-safe completing fragments, and restores

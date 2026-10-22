@@ -28,3 +28,14 @@ post-call fragment descriptors from the destination skb. This makes it
 possible to compare a reassembly head's newly planted `netmem` pointers with
 the current task-fragment page rather than inferring the relationship from
 source alone.
+
+Allocator-boundary probes are opt-in. `-pcp-commit` records the page and PCP
+watermarks at `free_frozen_page_commit`; `-pcp-drain` records pages returned to
+the buddy allocator; and `-page-alloc` records only order-0 UNMOVABLE
+`mm_page_alloc` events. `-no-net` suppresses the four high-volume skb raw
+tracepoints when only allocator and coalescing evidence is needed. For example:
+
+```sh
+sudo ./skbtrace -object trace.bpf.o -duration 180s \
+  -coalesce -pcp-commit -pcp-drain -page-alloc -no-net
+```

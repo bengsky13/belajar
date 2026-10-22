@@ -45,10 +45,23 @@ type event struct {
 	Page             uint64
 	PageRefcount     int32
 	PagePad          uint32
+	PageOrder        uint32
+	PageMigratetype  int32
+	PageGFP          uint64
+	PCPCount         int32
+	PCPHigh          int32
+	PCPHighMin       int32
+	PCPHighMax       int32
+	PCPBatch         int32
+	PCPFreeCount     int32
+	PCPFlags         uint8
+	PCPAllocFactor   uint8
+	PCPPad           uint16
 	Packet           [64]byte
 	Tail             [128]byte
 	Shinfo           [96]byte
 	SKBObject        [96]byte
+	CoalesceAlignPad uint32
 	CoalesceFrom     uint64
 	CoalesceResult   int32
 	CoalescePad      uint32
@@ -62,6 +75,9 @@ type objects struct {
 	TracePutPage              *ebpf.Program `ebpf:"trace_put_page"`
 	TraceSKBTryCoalesceEntry  *ebpf.Program `ebpf:"trace_skb_try_coalesce_entry"`
 	TraceSKBTryCoalesceReturn *ebpf.Program `ebpf:"trace_skb_try_coalesce_return"`
+	TraceMMPagePCPUDrain      *ebpf.Program `ebpf:"trace_mm_page_pcpu_drain"`
+	TraceFreeFrozenPageCommit *ebpf.Program `ebpf:"trace_free_frozen_page_commit"`
+	TraceMMPageAlloc          *ebpf.Program `ebpf:"trace_mm_page_alloc"`
 	Events                    *ebpf.Map     `ebpf:"events"`
 	CoalesceCalls             *ebpf.Map     `ebpf:"coalesce_calls"`
 }
@@ -88,6 +104,15 @@ func (o *objects) Close() {
 	if o.TraceSKBTryCoalesceReturn != nil {
 		o.TraceSKBTryCoalesceReturn.Close()
 	}
+	if o.TraceMMPagePCPUDrain != nil {
+		o.TraceMMPagePCPUDrain.Close()
+	}
+	if o.TraceFreeFrozenPageCommit != nil {
+		o.TraceFreeFrozenPageCommit.Close()
+	}
+	if o.TraceMMPageAlloc != nil {
+		o.TraceMMPageAlloc.Close()
+	}
 	if o.Events != nil {
 		o.Events.Close()
 	}
@@ -101,6 +126,10 @@ func main() {
 	duration := flag.Duration("duration", 30*time.Second, "maximum trace duration")
 	putPage := flag.Bool("put-page", false, "attach the lab-only put_page kprobe")
 	coalesce := flag.Bool("coalesce", false, "attach lab-only skb_try_coalesce entry/return probes")
+	pcpDrain := flag.Bool("pcp-drain", false, "attach the mm_page_pcpu_drain raw tracepoint")
+	pcpCommit := flag.Bool("pcp-commit", false, "attach the free_frozen_page_commit kprobe")
+	pageAlloc := flag.Bool("page-alloc", false, "trace order-0 UNMOVABLE mm_page_alloc events")
+	noNet := flag.Bool("no-net", false, "do not attach the four high-volume skb raw tracepoints")
 	interesting := flag.Bool("interesting", false, "print only jumbo skb events and short events with a live task_frag pointer")
 	flag.Parse()
 
@@ -117,34 +146,36 @@ func main() {
 	}
 	defer objs.Close()
 
-	queueLink, err := link.AttachRawTracepoint(link.RawTracepointOptions{
-		Name: "net_dev_queue", Program: objs.TraceNetDevQueue,
-	})
-	if err != nil {
-		log.Fatalf("attach net_dev_queue raw tracepoint: %v", err)
+	if !*noNet {
+		queueLink, err := link.AttachRawTracepoint(link.RawTracepointOptions{
+			Name: "net_dev_queue", Program: objs.TraceNetDevQueue,
+		})
+		if err != nil {
+			log.Fatalf("attach net_dev_queue raw tracepoint: %v", err)
+		}
+		defer queueLink.Close()
+		xmitLink, err := link.AttachRawTracepoint(link.RawTracepointOptions{
+			Name: "net_dev_start_xmit", Program: objs.TraceNetDevStartXmit,
+		})
+		if err != nil {
+			log.Fatalf("attach net_dev_start_xmit raw tracepoint: %v", err)
+		}
+		defer xmitLink.Close()
+		kfreeLink, err := link.AttachRawTracepoint(link.RawTracepointOptions{
+			Name: "kfree_skb", Program: objs.TraceKfreeSKB,
+		})
+		if err != nil {
+			log.Fatalf("attach kfree_skb raw tracepoint: %v", err)
+		}
+		defer kfreeLink.Close()
+		receiveLink, err := link.AttachRawTracepoint(link.RawTracepointOptions{
+			Name: "netif_receive_skb", Program: objs.TraceNetifReceiveSKB,
+		})
+		if err != nil {
+			log.Fatalf("attach netif_receive_skb raw tracepoint: %v", err)
+		}
+		defer receiveLink.Close()
 	}
-	defer queueLink.Close()
-	xmitLink, err := link.AttachRawTracepoint(link.RawTracepointOptions{
-		Name: "net_dev_start_xmit", Program: objs.TraceNetDevStartXmit,
-	})
-	if err != nil {
-		log.Fatalf("attach net_dev_start_xmit raw tracepoint: %v", err)
-	}
-	defer xmitLink.Close()
-	kfreeLink, err := link.AttachRawTracepoint(link.RawTracepointOptions{
-		Name: "kfree_skb", Program: objs.TraceKfreeSKB,
-	})
-	if err != nil {
-		log.Fatalf("attach kfree_skb raw tracepoint: %v", err)
-	}
-	defer kfreeLink.Close()
-	receiveLink, err := link.AttachRawTracepoint(link.RawTracepointOptions{
-		Name: "netif_receive_skb", Program: objs.TraceNetifReceiveSKB,
-	})
-	if err != nil {
-		log.Fatalf("attach netif_receive_skb raw tracepoint: %v", err)
-	}
-	defer receiveLink.Close()
 	var putPageLink link.Link
 	if *putPage {
 		putPageLink, err = link.Kprobe("put_page", objs.TracePutPage, nil)
@@ -165,6 +196,34 @@ func main() {
 			log.Fatalf("attach skb_try_coalesce kretprobe: %v", err)
 		}
 		defer coalesceReturnLink.Close()
+	}
+	var pcpDrainLink link.Link
+	if *pcpDrain {
+		pcpDrainLink, err = link.AttachRawTracepoint(link.RawTracepointOptions{
+			Name: "mm_page_pcpu_drain", Program: objs.TraceMMPagePCPUDrain,
+		})
+		if err != nil {
+			log.Fatalf("attach mm_page_pcpu_drain raw tracepoint: %v", err)
+		}
+		defer pcpDrainLink.Close()
+	}
+	var pcpCommitLink link.Link
+	if *pcpCommit {
+		pcpCommitLink, err = link.Kprobe("free_frozen_page_commit", objs.TraceFreeFrozenPageCommit, nil)
+		if err != nil {
+			log.Fatalf("attach free_frozen_page_commit kprobe: %v", err)
+		}
+		defer pcpCommitLink.Close()
+	}
+	var pageAllocLink link.Link
+	if *pageAlloc {
+		pageAllocLink, err = link.AttachRawTracepoint(link.RawTracepointOptions{
+			Name: "mm_page_alloc", Program: objs.TraceMMPageAlloc,
+		})
+		if err != nil {
+			log.Fatalf("attach mm_page_alloc raw tracepoint: %v", err)
+		}
+		defer pageAllocLink.Close()
 	}
 
 	reader, err := ringbuf.NewReader(objs.Events)
@@ -215,6 +274,23 @@ func main() {
 			}
 			continue
 		}
+		if ev.Kind == 7 {
+			fmt.Printf("event=mm_page_pcpu_drain tgid=%d tid=%d page=%#x order=%d migratetype=%d refcount=%d\n",
+				ev.TGID, ev.TID, ev.Page, ev.PageOrder, ev.PageMigratetype, ev.PageRefcount)
+			continue
+		}
+		if ev.Kind == 8 {
+			fmt.Printf("event=free_frozen_page_commit tgid=%d tid=%d page=%#x order=%d migratetype=%d refcount=%d pcp_count=%d high=%d high_min=%d high_max=%d batch=%d free_count=%d flags=%#x alloc_factor=%d\n",
+				ev.TGID, ev.TID, ev.Page, ev.PageOrder, ev.PageMigratetype, ev.PageRefcount,
+				ev.PCPCount, ev.PCPHigh, ev.PCPHighMin, ev.PCPHighMax, ev.PCPBatch,
+				ev.PCPFreeCount, ev.PCPFlags, ev.PCPAllocFactor)
+			continue
+		}
+		if ev.Kind == 9 {
+			fmt.Printf("event=mm_page_alloc tgid=%d tid=%d page=%#x order=%d migratetype=%d gfp=%#x refcount=%d\n",
+				ev.TGID, ev.TID, ev.Page, ev.PageOrder, ev.PageMigratetype, ev.PageGFP, ev.PageRefcount)
+			continue
+		}
 		if *interesting && ev.Len < 30000 && !(ev.TaskFragPage != 0 && ev.Len < 128) {
 			continue
 		}
@@ -243,6 +319,12 @@ func kindName(kind uint32) string {
 		return "put_page"
 	case 6:
 		return "skb_try_coalesce"
+	case 7:
+		return "mm_page_pcpu_drain"
+	case 8:
+		return "free_frozen_page_commit"
+	case 9:
+		return "mm_page_alloc"
 	default:
 		return fmt.Sprintf("unknown_%d", kind)
 	}

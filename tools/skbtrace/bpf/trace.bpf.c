@@ -71,6 +71,17 @@ struct task_struct {
 	struct page_frag task_frag;
 } __attribute__((preserve_access_index));
 
+struct per_cpu_pages {
+	int count;
+	int high;
+	int high_min;
+	int high_max;
+	int batch;
+	__u8 flags;
+	__u8 alloc_factor;
+	short free_count;
+} __attribute__((preserve_access_index));
+
 struct bpf_raw_tracepoint_args {
 	__u64 args[0];
 };
@@ -101,10 +112,23 @@ struct event {
 	__u64 page;
 	int page_refcount;
 	__u32 page_pad;
+	__u32 page_order;
+	int page_migratetype;
+	__u64 page_gfp;
+	int pcp_count;
+	int pcp_high;
+	int pcp_high_min;
+	int pcp_high_max;
+	int pcp_batch;
+	int pcp_free_count;
+	__u8 pcp_flags;
+	__u8 pcp_alloc_factor;
+	__u16 pcp_pad;
 	__u8 packet[64];
 	__u8 tail[128];
 	__u8 shinfo[96];
 	__u8 skb_object[96];
+	__u32 coalesce_align_pad;
 	__u64 coalesce_from;
 	int coalesce_result;
 	__u32 coalesce_pad;
@@ -134,6 +158,9 @@ enum event_kind {
 	EVENT_NETIF_RECEIVE_SKB = 4,
 	EVENT_PUT_PAGE = 5,
 	EVENT_SKB_TRY_COALESCE = 6,
+	EVENT_MM_PAGE_PCPU_DRAIN = 7,
+	EVENT_FREE_FROZEN_PAGE_COMMIT = 8,
+	EVENT_MM_PAGE_ALLOC = 9,
 };
 
 #define CORE_READ_INTO(dst, obj, field)                                      \
@@ -199,10 +226,23 @@ static __attribute__((always_inline)) int emit(struct sk_buff *skb, __u32 kind,
 	e->page = 0;
 	e->page_refcount = 0;
 	e->page_pad = 0;
+	e->page_order = 0;
+	e->page_migratetype = 0;
+	e->page_gfp = 0;
+	e->pcp_count = 0;
+	e->pcp_high = 0;
+	e->pcp_high_min = 0;
+	e->pcp_high_max = 0;
+	e->pcp_batch = 0;
+	e->pcp_free_count = 0;
+	e->pcp_flags = 0;
+	e->pcp_alloc_factor = 0;
+	e->pcp_pad = 0;
 	bpf_probe_read_kernel(e->packet, sizeof(e->packet), data);
 	bpf_probe_read_kernel(e->tail, sizeof(e->tail), data + head_len);
 	bpf_probe_read_kernel(e->shinfo, sizeof(e->shinfo), head + end_offset);
 	bpf_probe_read_kernel(e->skb_object, sizeof(e->skb_object), skb);
+	e->coalesce_align_pad = 0;
 	e->coalesce_from = coalesce_from;
 	e->coalesce_result = coalesce_result;
 	e->coalesce_pad = 0;
@@ -291,6 +331,101 @@ int trace_put_page(void *ctx)
 	e->tgid = (__u32)(pid_tgid >> 32);
 	e->tid = (__u32)pid_tgid;
 	e->page = (__u64)page;
+	CORE_READ_INTO(&e->page_refcount, page, _refcount.counter);
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
+SEC("raw_tracepoint/mm_page_pcpu_drain")
+int trace_mm_page_pcpu_drain(struct bpf_raw_tracepoint_args *ctx)
+{
+	struct event *e;
+	struct page *page = (struct page *)ctx->args[0];
+	__u64 pid_tgid;
+
+	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	if (!e)
+		return 0;
+	__builtin_memset(e, 0, sizeof(*e));
+	pid_tgid = bpf_get_current_pid_tgid();
+	e->kind = EVENT_MM_PAGE_PCPU_DRAIN;
+	e->tgid = (__u32)(pid_tgid >> 32);
+	e->tid = (__u32)pid_tgid;
+	e->page = (__u64)page;
+	e->page_order = (__u32)ctx->args[1];
+	e->page_migratetype = (int)ctx->args[2];
+	if (page)
+		CORE_READ_INTO(&e->page_refcount, page, _refcount.counter);
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
+SEC("kprobe/free_frozen_page_commit")
+int trace_free_frozen_page_commit(void *ctx)
+{
+	struct event *e;
+	struct per_cpu_pages *pcp;
+	struct page *page;
+	__u64 pid_tgid;
+	unsigned long order = 0;
+	unsigned long migratetype = 0;
+
+	/* x86-64 arguments: pcp=si, page=dx, migratetype=cx, order=r8. */
+	bpf_probe_read_kernel(&pcp, sizeof(pcp), (char *)ctx + 104);
+	bpf_probe_read_kernel(&page, sizeof(page), (char *)ctx + 96);
+	bpf_probe_read_kernel(&migratetype, sizeof(migratetype), (char *)ctx + 88);
+	bpf_probe_read_kernel(&order, sizeof(order), (char *)ctx + 72);
+	if (!pcp || !page)
+		return 0;
+
+	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	if (!e)
+		return 0;
+	__builtin_memset(e, 0, sizeof(*e));
+	pid_tgid = bpf_get_current_pid_tgid();
+	e->kind = EVENT_FREE_FROZEN_PAGE_COMMIT;
+	e->tgid = (__u32)(pid_tgid >> 32);
+	e->tid = (__u32)pid_tgid;
+	e->page = (__u64)page;
+	e->page_order = (__u32)order;
+	e->page_migratetype = (int)migratetype;
+	CORE_READ_INTO(&e->page_refcount, page, _refcount.counter);
+	CORE_READ_INTO(&e->pcp_count, pcp, count);
+	CORE_READ_INTO(&e->pcp_high, pcp, high);
+	CORE_READ_INTO(&e->pcp_high_min, pcp, high_min);
+	CORE_READ_INTO(&e->pcp_high_max, pcp, high_max);
+	CORE_READ_INTO(&e->pcp_batch, pcp, batch);
+	CORE_READ_INTO(&e->pcp_free_count, pcp, free_count);
+	CORE_READ_INTO(&e->pcp_flags, pcp, flags);
+	CORE_READ_INTO(&e->pcp_alloc_factor, pcp, alloc_factor);
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
+SEC("raw_tracepoint/mm_page_alloc")
+int trace_mm_page_alloc(struct bpf_raw_tracepoint_args *ctx)
+{
+	struct event *e;
+	struct page *page = (struct page *)ctx->args[0];
+	__u32 order = (__u32)ctx->args[1];
+	int migratetype = (int)ctx->args[3];
+	__u64 pid_tgid;
+
+	/* The reclaim experiment only needs order-0 UNMOVABLE allocations. */
+	if (!page || order != 0 || migratetype != 0)
+		return 0;
+	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	if (!e)
+		return 0;
+	__builtin_memset(e, 0, sizeof(*e));
+	pid_tgid = bpf_get_current_pid_tgid();
+	e->kind = EVENT_MM_PAGE_ALLOC;
+	e->tgid = (__u32)(pid_tgid >> 32);
+	e->tid = (__u32)pid_tgid;
+	e->page = (__u64)page;
+	e->page_order = order;
+	e->page_migratetype = migratetype;
+	e->page_gfp = ctx->args[2];
 	CORE_READ_INTO(&e->page_refcount, page, _refcount.counter);
 	bpf_ringbuf_submit(e, 0);
 	return 0;

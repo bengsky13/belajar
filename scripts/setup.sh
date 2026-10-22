@@ -37,6 +37,10 @@ sysctl -w net.ipv4.conf.default.rp_filter=0
 sysctl -w net.ipv4.conf.all.send_redirects=0
 sysctl -w net.ipv4.conf.bengskytap.rp_filter=0
 sysctl -w net.ipv4.conf.bengskyv0.rp_filter=0
+# The high-order PCP priming probe deliberately holds incomplete anchor
+# queues while a large local batch is allocated and released under TCG.
+sysctl -w net.ipv4.ipfrag_time=120
+sysctl -w net.ipv4.ipfrag_max_dist=0
 
 if ! nft list table ip pwn >/dev/null 2>&1; then
 	nft add table ip pwn
@@ -46,12 +50,16 @@ fi
 
 # The disposable local-reassembly probe needs to bypass conntrack defrag so
 # IPv4's LOCAL_DELIVER queue reaches skb_try_coalesce. This matches only the
-# lab's protocol-253 traffic addressed to the TAP itself.
+# lab's protocol-252/253 traffic addressed to the TAP itself. Protocol 252 is
+# reserved here for the same-CPU PCP priming queue.
 if ! nft list chain ip pwn local_raw >/dev/null 2>&1; then
 	nft add chain ip pwn local_raw '{ type filter hook prerouting priority -500; policy accept; }'
 fi
 if ! nft list chain ip pwn local_raw | grep -q 'ip daddr 10.0.0.1 meta l4proto 253 notrack'; then
 	nft add rule ip pwn local_raw ip daddr 10.0.0.1 meta l4proto 253 notrack
+fi
+if ! nft list chain ip pwn local_raw | grep -q 'ip daddr 10.0.0.1 meta l4proto 252 notrack'; then
+	nft add rule ip pwn local_raw ip daddr 10.0.0.1 meta l4proto 252 notrack
 fi
 
 echo "ready"

