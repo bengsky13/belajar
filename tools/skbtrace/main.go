@@ -85,6 +85,7 @@ func main() {
 	objPath := flag.String("object", "trace.bpf.o", "compiled BPF object")
 	duration := flag.Duration("duration", 30*time.Second, "maximum trace duration")
 	putPage := flag.Bool("put-page", false, "attach the lab-only put_page kprobe")
+	interesting := flag.Bool("interesting", false, "print only jumbo skb events and short events with a live task_frag pointer")
 	flag.Parse()
 
 	if err := rlimit.RemoveMemlock(); err != nil {
@@ -170,6 +171,9 @@ func main() {
 		if ev.Kind == 5 {
 			fmt.Printf("event=put_page tgid=%d tid=%d page=%#x refcount_before=%d\n",
 				ev.TGID, ev.TID, ev.Page, ev.PageRefcount)
+			continue
+		}
+		if *interesting && ev.Len < 30000 && !(ev.TaskFragPage != 0 && ev.Len < 128) {
 			continue
 		}
 		fmt.Printf("event=%s tgid=%d tid=%d skb=%#x head=%#x data=%#x len=%d data_len=%d head_len=%d data_off=%d tail=%d end=%d task_frag_page=%#x task_frag_off=%d task_frag_size=%d task_frag_refcount=%d net=%d trans=%d csum_start=%d csum_offset=%d\n",

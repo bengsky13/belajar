@@ -213,6 +213,25 @@ payload offset 80 from its `0x72` fill to the exact controlled prefix
   -stale-natural-overlap -capture-ms 500
 ```
 
+`-stale-natural-anon` is a negative allocator experiment, kept to make the
+remaining boundary reproducible.  It expires a configurable batch of
+incomplete order-3 jumbo fragments, faults a populated anonymous mapping, then
+looks for a marker written through the dangling `current->task_frag` cache:
+
+```sh
+./test -stale-options-write -stale-natural-frag \
+  -stale-natural-anon -stale-anon-jumbos 96 \
+  -stale-anon-wait-ms 32000 -stale-anon-size $((384 << 20))
+```
+
+On the exact Alpine 6.18.52 disposable kernel, both 64 MiB and 384 MiB runs
+reported `marker_offset=-1`, including the 96-jumbo expiry attempt.  The freed
+page remains an order-3 compound allocation on the high-order per-CPU page
+list, while anonymous/KVM backing faults request order-0 pages.  This result
+does not demonstrate reclaim as guest RAM or an EPT page-table page; a usable
+chain still needs an explicit order-3-to-order-0 transition or a suitable
+security-sensitive order-3 consumer.
+
 The egress form briefly raises the guest interface MTU to 65535, sends the
 jumbo descriptor seed followed by MTU-safe completing fragments, and restores
 the original MTU on every return path:
