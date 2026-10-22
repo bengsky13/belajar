@@ -1,1 +1,1 @@
-echo check pass
+curl http://chall.itsbengsky.id
