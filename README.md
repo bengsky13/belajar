@@ -172,8 +172,8 @@ exactly the first three `skb_shared_info` bytes: `flags`, `meta_len`, and
 `nr_frags`.  Leave `destructor_arg` zero.  Although the first byte enables the
 zerocopy flag, `skb_zcopy()` then returns NULL and normal fragment release sees
 the forged `nr_frags=1`.  This mode is only for proving the unmatched page
-reference decrement in the instrumented disposable kernel; a target chain must
-plant a genuine descriptor without supplying a host pointer.
+reference decrement in the instrumented disposable kernel.  The natural
+descriptor mode below removes that manual pointer input.
 
 Use `-stale-groom-frag-page-file PATH` for the safer two-stage variant.  Its
 length-14 probe pauses on the same locked kernel thread; write the tracer's
@@ -185,5 +185,30 @@ refcount 4 when the forged child reached `kfree_skb`, then at refcount 0 on the
 next same-thread event after the fragment SKBs were released.  The forged
 shared-info bytes contained `flags=1`, `nr_frags=1`, a zero `destructor_arg`,
 and the selected page in `frags[0]`.  This directly validates the extra page
-unref and dangling `task_frag.page` primitive in the disposable lab; it does
-not yet solve descriptor planting on the hosted target.
+unref and dangling `task_frag.page` primitive in the disposable lab.
+
+`-stale-natural-frag` removes the supplied-pointer requirement.  It pads the
+short middle fragment to 33,086 bytes and requests a 318-byte linear virtio
+header.  The remaining 32,768 bytes become one genuine host `frags[0]` page.
+Sixty-nine VLAN tags leave two bytes of linear tailroom in the 384-byte skb
+head, and option length 7 changes exactly `flags`, `meta_len`, and `nr_frags`
+to one.  Trimming the short IPv4 fragment releases its page while preserving
+the descriptor bytes; the next ordinary TAP write immediately reclaims that
+same order-3 page as `current->task_frag` before the stale slot is activated.
+The disposable kernel trace showed the descriptor and task-fragment pointers
+equal and the page refcount falling from 3 to 0.
+
+The egress form briefly raises the guest interface MTU to 65535, sends the
+jumbo descriptor seed followed by MTU-safe completing fragments, and restores
+the original MTU on every return path:
+
+```sh
+./test -egress -stale-options-write -stale-natural-frag \
+  -dst github.com -egress-rest 4000 -egress-wait-ms 100
+```
+
+This implements an address-independent host page-UAF primitive for the
+Firecracker TAP boundary and verifies its allocator behavior in the disposable
+kernel.  Hosted-target execution remains to be verified.  It is not by itself
+host command execution: the dangling host page still needs a reliable reclaim
+and controlled-write stage.

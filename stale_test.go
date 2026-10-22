@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"net"
 	"testing"
 )
 
@@ -80,5 +81,53 @@ func TestStalePageGroomFrameFragmentDescriptor(t *testing.T) {
 	}
 	if got := binary.LittleEndian.Uint32(frame[124:128]); got != 0 {
 		t.Fatalf("frags[0].offset=%d, want 0", got)
+	}
+}
+
+func TestStaleFragSeedFrame(t *testing.T) {
+	frame := staleFragSeedFrame(8192, 0x73)
+	if len(frame) != 8192 {
+		t.Fatalf("length=%d, want 8192", len(frame))
+	}
+	if got := binary.BigEndian.Uint16(frame[12:14]); got != ethPExperiment {
+		t.Fatalf("EtherType=%#x, want %#x", got, ethPExperiment)
+	}
+	if !bytes.Equal(frame[14:64], bytesRepeat(50, 0x73)) {
+		t.Fatal("seed payload does not retain marker")
+	}
+}
+
+func TestStalePaddedGSOFrame(t *testing.T) {
+	original := []byte{1, 2, 3, 4}
+	padded := stalePaddedGSOFrame(original, 8192, 0x74)
+	if len(padded) != 8192 {
+		t.Fatalf("length=%d, want 8192", len(padded))
+	}
+	if !bytes.Equal(padded[:len(original)], original) {
+		t.Fatalf("prefix=%x, want %x", padded[:len(original)], original)
+	}
+	if !bytes.Equal(padded[len(original):64], bytesRepeat(64-len(original), 0x74)) {
+		t.Fatal("padding does not retain marker")
+	}
+}
+
+func TestStaleNaturalFragmentGeometry(t *testing.T) {
+	c := cfg{}
+	applyStaleNaturalFrag(&c)
+	if !c.page || c.vlanTags != 69 || c.staleOptSkip != 6 || c.staleOptLen != 7 {
+		t.Fatalf("unexpected natural fragment configuration: %+v", c)
+	}
+	shortIP := ipv4PacketWithOptionsFor(8, true, bytesRepeat(8, 0x42), ipID, nil,
+		net.ParseIP("192.0.2.2"), net.ParseIP("192.0.2.1"), ipProtoRaw)
+	mac := net.HardwareAddr{2, 0, 0, 0, 0, 1}
+	shortFrame := egressFrame(shortIP, mac, mac, c.vlanTags)
+	if len(shortFrame) != c.staleFragHdrLen {
+		t.Fatalf("short frame length=%d, want hdr_len=%d", len(shortFrame), c.staleFragHdrLen)
+	}
+	if c.staleFragPadLen-c.staleFragHdrLen != 32768 {
+		t.Fatalf("non-linear length=%d, want one order-3 page", c.staleFragPadLen-c.staleFragHdrLen)
+	}
+	if got := len(stalePaddedGSOFrame(shortFrame, c.staleFragPadLen, 0x74)); got != 33086 {
+		t.Fatalf("padded length=%d, want 33086", got)
 	}
 }

