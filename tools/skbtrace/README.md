@@ -21,3 +21,10 @@ kernel inlines `put_page`.  In the disposable lab only, `-put-page` also
 attaches a `put_page` kprobe and prints calls that reach the out-of-line symbol.
 The raw tracepoint collector remains the default because the hosted guest may
 deny kprobes.
+
+`-coalesce` is also disposable-lab-only. It attaches entry and return probes
+to `skb_try_coalesce`, records the result, and decodes the first three
+post-call fragment descriptors from the destination skb. This makes it
+possible to compare a reassembly head's newly planted `netmem` pointers with
+the current task-fragment page rather than inferring the relationship from
+source alone.

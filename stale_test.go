@@ -157,6 +157,67 @@ func TestStaleNaturalOverlapGeometry(t *testing.T) {
 	}
 }
 
+func TestStaleNaturalOverlapLocalReassemblyGeometry(t *testing.T) {
+	c := cfg{}
+	applyStaleNaturalFrag(&c)
+	want := net.ParseIP("10.0.0.1").To4()
+	middle, head, bridge, tail := staleNaturalLocalCoalesceFrames(c, ipID+2)
+	for name, frame := range map[string][]byte{"middle": middle, "head": head, "bridge": bridge, "tail": tail} {
+		ip := ipv4Of(frame)
+		if ip == nil {
+			t.Fatalf("%s frame does not contain IPv4", name)
+		}
+		if got := net.IP(ip[16:20]); !got.Equal(want) {
+			t.Fatalf("%s destination=%s, want %s", name, got, want)
+		}
+		if ipChecksum(ip[:int(ip[0]&0x0f)*4]) != 0 {
+			t.Fatalf("%s has an invalid IPv4 checksum", name)
+		}
+	}
+	middleIP := ipv4Of(middle)
+	bridgeIP := ipv4Of(bridge)
+	tailIP := ipv4Of(tail)
+	if got := int(binary.BigEndian.Uint16(bridgeIP[6:])&0x1fff) * 8; got != 8 {
+		t.Fatalf("bridge offset=%d, want 8", got)
+	}
+	if got := int(binary.BigEndian.Uint16(middleIP[6:])&0x1fff) * 8; got != 32 {
+		t.Fatalf("middle offset=%d, want 32", got)
+	}
+	middlePayloadLen := int(binary.BigEndian.Uint16(middleIP[2:])) - ipLen
+	if got := int(binary.BigEndian.Uint16(tailIP[6:])&0x1fff) * 8; got != 32+middlePayloadLen {
+		t.Fatalf("tail offset=%d, want %d", got, 32+middlePayloadLen)
+	}
+}
+
+func TestStaleNaturalLocalSingleRefGeometry(t *testing.T) {
+	c := cfg{}
+	applyStaleNaturalFrag(&c)
+	head, bridge := staleNaturalLocalSingleRefFrames(c, ipID+3)
+	if len(head) != c.staleFragPadLen {
+		t.Fatalf("padded head length=%d, want %d", len(head), c.staleFragPadLen)
+	}
+	if len(ipv4Of(head)) < ipLen+8 {
+		t.Fatal("single-ref head does not contain its logical IPv4 payload")
+	}
+	bridgeIP := ipv4Of(bridge)
+	if bridgeIP == nil {
+		t.Fatal("single-ref bridge does not contain IPv4")
+	}
+	if got := int(binary.BigEndian.Uint16(bridgeIP[6:])&0x1fff) * 8; got != 8 {
+		t.Fatalf("single-ref bridge offset=%d, want 8", got)
+	}
+	if binary.BigEndian.Uint16(bridgeIP[6:])&0x2000 != 0 {
+		t.Fatal("single-ref bridge must complete the local datagram")
+	}
+	if got := int(binary.BigEndian.Uint16(bridgeIP[2:])) - ipLen; got != 512 {
+		t.Fatalf("single-ref bridge payload=%d, want 512", got)
+	}
+	jumbo := staleNaturalJumboFragment(c, ipID+4, 8, 0x77)
+	if len(jumbo) != c.staleFragPadLen {
+		t.Fatalf("single-ref jumbo length=%d, want %d", len(jumbo), c.staleFragPadLen)
+	}
+}
+
 func TestIPv4PayloadWindow(t *testing.T) {
 	id := uint16(ipID + 2)
 	payload := bytesRepeat(64, 0x72)

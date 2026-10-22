@@ -49,15 +49,21 @@ type event struct {
 	Tail             [128]byte
 	Shinfo           [96]byte
 	SKBObject        [96]byte
+	CoalesceFrom     uint64
+	CoalesceResult   int32
+	CoalescePad      uint32
 }
 
 type objects struct {
-	TraceNetDevQueue     *ebpf.Program `ebpf:"trace_net_dev_queue"`
-	TraceNetDevStartXmit *ebpf.Program `ebpf:"trace_net_dev_start_xmit"`
-	TraceKfreeSKB        *ebpf.Program `ebpf:"trace_kfree_skb"`
-	TraceNetifReceiveSKB *ebpf.Program `ebpf:"trace_netif_receive_skb"`
-	TracePutPage         *ebpf.Program `ebpf:"trace_put_page"`
-	Events               *ebpf.Map     `ebpf:"events"`
+	TraceNetDevQueue          *ebpf.Program `ebpf:"trace_net_dev_queue"`
+	TraceNetDevStartXmit      *ebpf.Program `ebpf:"trace_net_dev_start_xmit"`
+	TraceKfreeSKB             *ebpf.Program `ebpf:"trace_kfree_skb"`
+	TraceNetifReceiveSKB      *ebpf.Program `ebpf:"trace_netif_receive_skb"`
+	TracePutPage              *ebpf.Program `ebpf:"trace_put_page"`
+	TraceSKBTryCoalesceEntry  *ebpf.Program `ebpf:"trace_skb_try_coalesce_entry"`
+	TraceSKBTryCoalesceReturn *ebpf.Program `ebpf:"trace_skb_try_coalesce_return"`
+	Events                    *ebpf.Map     `ebpf:"events"`
+	CoalesceCalls             *ebpf.Map     `ebpf:"coalesce_calls"`
 }
 
 func (o *objects) Close() {
@@ -76,8 +82,17 @@ func (o *objects) Close() {
 	if o.TracePutPage != nil {
 		o.TracePutPage.Close()
 	}
+	if o.TraceSKBTryCoalesceEntry != nil {
+		o.TraceSKBTryCoalesceEntry.Close()
+	}
+	if o.TraceSKBTryCoalesceReturn != nil {
+		o.TraceSKBTryCoalesceReturn.Close()
+	}
 	if o.Events != nil {
 		o.Events.Close()
+	}
+	if o.CoalesceCalls != nil {
+		o.CoalesceCalls.Close()
 	}
 }
 
@@ -85,6 +100,7 @@ func main() {
 	objPath := flag.String("object", "trace.bpf.o", "compiled BPF object")
 	duration := flag.Duration("duration", 30*time.Second, "maximum trace duration")
 	putPage := flag.Bool("put-page", false, "attach the lab-only put_page kprobe")
+	coalesce := flag.Bool("coalesce", false, "attach lab-only skb_try_coalesce entry/return probes")
 	interesting := flag.Bool("interesting", false, "print only jumbo skb events and short events with a live task_frag pointer")
 	flag.Parse()
 
@@ -137,6 +153,19 @@ func main() {
 		}
 		defer putPageLink.Close()
 	}
+	var coalesceEntryLink, coalesceReturnLink link.Link
+	if *coalesce {
+		coalesceEntryLink, err = link.Kprobe("skb_try_coalesce", objs.TraceSKBTryCoalesceEntry, nil)
+		if err != nil {
+			log.Fatalf("attach skb_try_coalesce kprobe: %v", err)
+		}
+		defer coalesceEntryLink.Close()
+		coalesceReturnLink, err = link.Kretprobe("skb_try_coalesce", objs.TraceSKBTryCoalesceReturn, nil)
+		if err != nil {
+			log.Fatalf("attach skb_try_coalesce kretprobe: %v", err)
+		}
+		defer coalesceReturnLink.Close()
+	}
 
 	reader, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
@@ -173,6 +202,19 @@ func main() {
 				ev.TGID, ev.TID, ev.Page, ev.PageRefcount)
 			continue
 		}
+		if ev.Kind == 6 {
+			fmt.Printf("event=skb_try_coalesce tgid=%d tid=%d result=%d to=%#x from=%#x head=%#x len=%d data_len=%d end=%d task_frag_page=%#x task_frag_refcount=%d nr_frags=%d\n",
+				ev.TGID, ev.TID, ev.CoalesceResult, ev.SKB, ev.CoalesceFrom, ev.Head,
+				ev.Len, ev.DataLen, ev.EndOffset, ev.TaskFragPage, ev.TaskFragRefcount, ev.Shinfo[2])
+			for i := 0; i < min(int(ev.Shinfo[2]), 3); i++ {
+				off := 48 + i*16
+				fmt.Printf("  frag=%d netmem=%#x len=%d offset=%d\n", i,
+					binary.LittleEndian.Uint64(ev.Shinfo[off:off+8]),
+					binary.LittleEndian.Uint32(ev.Shinfo[off+8:off+12]),
+					binary.LittleEndian.Uint32(ev.Shinfo[off+12:off+16]))
+			}
+			continue
+		}
 		if *interesting && ev.Len < 30000 && !(ev.TaskFragPage != 0 && ev.Len < 128) {
 			continue
 		}
@@ -199,6 +241,8 @@ func kindName(kind uint32) string {
 		return "netif_receive_skb"
 	case 5:
 		return "put_page"
+	case 6:
+		return "skb_try_coalesce"
 	default:
 		return fmt.Sprintf("unknown_%d", kind)
 	}

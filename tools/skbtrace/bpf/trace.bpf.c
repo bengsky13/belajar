@@ -8,7 +8,13 @@ typedef unsigned long long __u64;
 
 #define SEC(name) __attribute__((section(name), used))
 #define __uint(name, value) int (*name)[value]
+#define __type(name, value) value *name
+#define BPF_MAP_TYPE_HASH 1
 #define BPF_MAP_TYPE_RINGBUF 27
+#define BPF_ANY 0
+#define BPF_FUNC_map_lookup_elem 1
+#define BPF_FUNC_map_update_elem 2
+#define BPF_FUNC_map_delete_elem 3
 #define BPF_FUNC_get_current_pid_tgid 14
 #define BPF_FUNC_get_current_task 35
 #define BPF_FUNC_probe_read_kernel 113
@@ -17,6 +23,13 @@ typedef unsigned long long __u64;
 
 static __u64 (*bpf_get_current_pid_tgid)(void) =
 	(void *)BPF_FUNC_get_current_pid_tgid;
+static void *(*bpf_map_lookup_elem)(void *map, const void *key) =
+	(void *)BPF_FUNC_map_lookup_elem;
+static long (*bpf_map_update_elem)(void *map, const void *key,
+				   const void *value, __u64 flags) =
+	(void *)BPF_FUNC_map_update_elem;
+static long (*bpf_map_delete_elem)(void *map, const void *key) =
+	(void *)BPF_FUNC_map_delete_elem;
 static void *(*bpf_get_current_task)(void) =
 	(void *)BPF_FUNC_get_current_task;
 static long (*bpf_probe_read_kernel)(void *dst, __u32 size,
@@ -92,6 +105,9 @@ struct event {
 	__u8 tail[128];
 	__u8 shinfo[96];
 	__u8 skb_object[96];
+	__u64 coalesce_from;
+	int coalesce_result;
+	__u32 coalesce_pad;
 };
 
 struct {
@@ -99,19 +115,34 @@ struct {
 	__uint(max_entries, 1 << 20);
 } events SEC(".maps");
 
+struct coalesce_call {
+	struct sk_buff *to;
+	struct sk_buff *from;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u64);
+	__type(value, struct coalesce_call);
+} coalesce_calls SEC(".maps");
+
 enum event_kind {
 	EVENT_NET_DEV_QUEUE = 1,
 	EVENT_NET_DEV_START_XMIT = 2,
 	EVENT_KFREE_SKB = 3,
 	EVENT_NETIF_RECEIVE_SKB = 4,
 	EVENT_PUT_PAGE = 5,
+	EVENT_SKB_TRY_COALESCE = 6,
 };
 
 #define CORE_READ_INTO(dst, obj, field)                                      \
 	bpf_probe_read_kernel((dst), sizeof(*(dst)),                           \
 			      __builtin_preserve_access_index(&(obj)->field))
 
-static __attribute__((always_inline)) int emit(struct sk_buff *skb, __u32 kind)
+static __attribute__((always_inline)) int emit(struct sk_buff *skb, __u32 kind,
+					       __u64 coalesce_from,
+					       int coalesce_result)
 {
 	struct event *e;
 	unsigned char *head;
@@ -172,6 +203,9 @@ static __attribute__((always_inline)) int emit(struct sk_buff *skb, __u32 kind)
 	bpf_probe_read_kernel(e->tail, sizeof(e->tail), data + head_len);
 	bpf_probe_read_kernel(e->shinfo, sizeof(e->shinfo), head + end_offset);
 	bpf_probe_read_kernel(e->skb_object, sizeof(e->skb_object), skb);
+	e->coalesce_from = coalesce_from;
+	e->coalesce_result = coalesce_result;
+	e->coalesce_pad = 0;
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }
@@ -179,25 +213,61 @@ static __attribute__((always_inline)) int emit(struct sk_buff *skb, __u32 kind)
 SEC("raw_tracepoint/net_dev_queue")
 int trace_net_dev_queue(struct bpf_raw_tracepoint_args *ctx)
 {
-	return emit((struct sk_buff *)ctx->args[0], EVENT_NET_DEV_QUEUE);
+	return emit((struct sk_buff *)ctx->args[0], EVENT_NET_DEV_QUEUE, 0, 0);
 }
 
 SEC("raw_tracepoint/net_dev_start_xmit")
 int trace_net_dev_start_xmit(struct bpf_raw_tracepoint_args *ctx)
 {
-	return emit((struct sk_buff *)ctx->args[0], EVENT_NET_DEV_START_XMIT);
+	return emit((struct sk_buff *)ctx->args[0], EVENT_NET_DEV_START_XMIT, 0, 0);
 }
 
 SEC("raw_tracepoint/kfree_skb")
 int trace_kfree_skb(struct bpf_raw_tracepoint_args *ctx)
 {
-	return emit((struct sk_buff *)ctx->args[0], EVENT_KFREE_SKB);
+	return emit((struct sk_buff *)ctx->args[0], EVENT_KFREE_SKB, 0, 0);
 }
 
 SEC("raw_tracepoint/netif_receive_skb")
 int trace_netif_receive_skb(struct bpf_raw_tracepoint_args *ctx)
 {
-	return emit((struct sk_buff *)ctx->args[0], EVENT_NETIF_RECEIVE_SKB);
+	return emit((struct sk_buff *)ctx->args[0], EVENT_NETIF_RECEIVE_SKB, 0, 0);
+}
+
+SEC("kprobe/skb_try_coalesce")
+int trace_skb_try_coalesce_entry(void *ctx)
+{
+	struct coalesce_call call = {};
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+
+	/* x86-64 struct pt_regs.di/si are the first two function arguments. */
+	bpf_probe_read_kernel(&call.to, sizeof(call.to), (char *)ctx + 112);
+	bpf_probe_read_kernel(&call.from, sizeof(call.from), (char *)ctx + 104);
+	if (!call.to || !call.from)
+		return 0;
+	bpf_map_update_elem(&coalesce_calls, &pid_tgid, &call, BPF_ANY);
+	return 0;
+}
+
+SEC("kretprobe/skb_try_coalesce")
+int trace_skb_try_coalesce_return(void *ctx)
+{
+	struct coalesce_call *call;
+	struct sk_buff *to;
+	struct sk_buff *from;
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	unsigned long result = 0;
+
+	call = bpf_map_lookup_elem(&coalesce_calls, &pid_tgid);
+	if (!call)
+		return 0;
+	to = call->to;
+	from = call->from;
+	/* x86-64 struct pt_regs.ax is the function return value. */
+	bpf_probe_read_kernel(&result, sizeof(result), (char *)ctx + 80);
+	emit(to, EVENT_SKB_TRY_COALESCE, (__u64)from, result != 0);
+	bpf_map_delete_elem(&coalesce_calls, &pid_tgid);
+	return 0;
 }
 
 SEC("kprobe/put_page")

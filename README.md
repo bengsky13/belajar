@@ -232,6 +232,45 @@ does not demonstrate reclaim as guest RAM or an EPT page-table page; a usable
 chain still needs an explicit order-3-to-order-0 transition or a suitable
 security-sensitive order-3 consumer.
 
+The disposable lab also has a local-reassembly chain that turns the dangling
+page into a clean order-3 reallocation and read primitive.  `scripts/setup.sh`
+installs a destination-specific `notrack` rule for protocol 253 so the second
+datagram reaches the IPv4 `LOCAL_DELIVER` reassembly queue, where
+`skb_try_coalesce` is enabled.  The stale-options thread is pinned to one
+allowed CPU so freeing and reclaiming use the same high-order per-CPU page
+list.
+
+```sh
+./test -stale-options-write -stale-natural-frag \
+  -stale-natural-overlap -stale-overlap-local-reassembly \
+  -stale-local-rollover 10 -stale-local-single-ref \
+  -stale-single-ref-anchors 8 -capture-ms 500
+```
+
+The single-reference variant holds a `kmalloc`-backed local reassembly in a
+raw protocol-253 socket.  A 512-byte page-frag-backed bridge cannot fit in the
+head's linear tailroom, so successful coalescing plants the dangling page as a
+genuine `frags[0]`.  Eight incomplete jumbo anchors make the order-3 reclaim
+robust.  Exhausting `current->task_frag` and closing the raw socket then frees
+that page at refcount zero while one anchor retains a stale descriptor.  Eight
+new jumbos reclaim it, and completing anchors identifies the stale one by
+reading the new `0x80..0x87` fill through the old descriptor.
+
+On the exact Alpine 6.18.52 disposable kernel, the tracer observed page
+`0xffffe74640091200` in the original natural fragment, the first anchor, and
+the coalesced descriptor (`nr_frags=1`, refcount 2).  After rollover moved the
+task-fragment cache to another page, the first new jumbo received the same
+`0xffffe74640091200`; anchor zero then disclosed its new `0x80` fill.  The
+program exited successfully, all 29 Linux tests passed, and `dmesg` remained
+empty through verification.
+
+This mode intentionally leaves incomplete queues with stale descriptors and
+is only for a disposable VM that is shut down before their fragment timers
+expire.  It proves clean reallocation plus controlled read of a reused order-3
+page, not host command execution.  The next step is to replace the known-fill
+jumbo owner with a security-sensitive order-3 allocation and use the stale
+anchor's later release or disclosure against that object.
+
 The egress form briefly raises the guest interface MTU to 65535, sends the
 jumbo descriptor seed followed by MTU-safe completing fragments, and restores
 the original MTU on every return path:

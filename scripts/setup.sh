@@ -44,4 +44,14 @@ if ! nft list table ip pwn >/dev/null 2>&1; then
 	nft add rule ip pwn pre ct state new accept
 fi
 
+# The disposable local-reassembly probe needs to bypass conntrack defrag so
+# IPv4's LOCAL_DELIVER queue reaches skb_try_coalesce. This matches only the
+# lab's protocol-253 traffic addressed to the TAP itself.
+if ! nft list chain ip pwn local_raw >/dev/null 2>&1; then
+	nft add chain ip pwn local_raw '{ type filter hook prerouting priority -500; policy accept; }'
+fi
+if ! nft list chain ip pwn local_raw | grep -q 'ip daddr 10.0.0.1 meta l4proto 253 notrack'; then
+	nft add rule ip pwn local_raw ip daddr 10.0.0.1 meta l4proto 253 notrack
+fi
+
 echo "ready"
