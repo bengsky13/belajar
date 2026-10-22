@@ -344,7 +344,48 @@ diagnostic run that allowed the process to exit produced the expected
 `BUG: Bad page map` reports, independently confirming that the stale release
 had freed a still-installed PTE page. This still is not host command execution:
 the target Firecracker host requires the analogous overlap with its second-level
-KVM page tables, which cannot be exercised by this userspace-only guest fixture.
+KVM page tables. The nested-KVM fixture below exercises that allocator and
+translation case in a disposable L1 guest; reproducing it from the hosted L2
+guest remains separate work.
+
+The lab now also exercises that second-level translation case directly. QEMU
+TCG with `-cpu max` exposes AMD SVM/NPT to the Alpine guest, so that guest can
+act as the vulnerable L1 KVM host for a tiny L2. Load `kvm_amd` and replace the
+PTE flags above with:
+
+```sh
+  -stale-single-ref-kvm-npt \
+  -stale-single-ref-kvm-npt-count 1536 \
+  -stale-single-ref-hold-ms 300000
+```
+
+The harness registers a sparse L2 memory slot and uses two real-mode vCPUs.
+The first vCPU faults one page in each 2 MiB GPA region, forcing distinct NPT
+leaf pages; root-readable pagemap PFNs make their leaf entries identifiable.
+The second vCPU is initialized before corruption and later accesses the victim
+GPA without a stale nested-TLB translation. The 1,536 regions are divided into
+warmup, first-reclaim, and alias-reclaim phases so KVM repeatedly drains and
+refills its per-vCPU MMU page cache around the stale release.
+
+On the exact Alpine 6.18.52 fixture, anchor zero disclosed NPT leaf entry
+`0x8d81e67`, which mapped sparse L2 page 815 at GPA `0x69e00000` to physical
+page `0x8d81000`. Completing the anchor freed that NPT page while its parent
+entry remained installed. The final 512 leaf faults reclaimed it as another
+NPT leaf. A write by the second vCPU through GPA `0x69e00000` then modified
+sparse backing page 1068 at GPA `0x89800000`, while page 815 remained unchanged:
+
+```text
+changed_before=[] changed_after=[1068]
+original_sparse_page=815 alias_page=1068 matched=true
+```
+
+This proves a cross-GPA writable alias through a prematurely freed and reused
+KVM NPT page. Live `dmesg` was empty and the outer disposable VM was powered
+off while the process was held. It is the allocator and translation primitive
+needed at the Firecracker boundary, but it is not yet execution in the hosted
+Firecracker process: the target run must trigger fresh host NPT/EPT leaf faults
+using previously untouched guest-physical regions, identify the alias from
+inside the guest, and redirect it to host-sensitive memory before teardown.
 
 The egress form briefly raises the guest interface MTU to 65535, sends the
 jumbo descriptor seed followed by MTU-safe completing fragments, and restores

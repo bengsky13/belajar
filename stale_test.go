@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net"
+	"os"
 	"testing"
+	"unsafe"
 )
 
 func TestStalePageGroomFrameUsermodeHelperLayout(t *testing.T) {
@@ -261,6 +263,65 @@ func TestSparsePTEFirstOffset(t *testing.T) {
 	const pte = uint64(0x8000000012345067)
 	if got := pte & x86PTEAddressMask; got != 0x12345000 {
 		t.Fatalf("PTE physical address=%#x, want %#x", got, uint64(0x12345000))
+	}
+}
+
+func TestKVMNPTABIAndTouchProgram(t *testing.T) {
+	if got := unsafe.Sizeof(kvmUserspaceMemoryRegion{}); got != 32 {
+		t.Fatalf("kvm_userspace_memory_region size=%d, want 32", got)
+	}
+	if got := unsafe.Sizeof(kvmRegs{}); got != 144 {
+		t.Fatalf("kvm_regs size=%d, want 144", got)
+	}
+	if got := unsafe.Sizeof(kvmSregs{}); got != 312 {
+		t.Fatalf("kvm_sregs size=%d, want 312", got)
+	}
+	if got := kvmIOC(iocWrite, kvmSetUserMemoryRegionNR, unsafe.Sizeof(kvmUserspaceMemoryRegion{})); got != 0x4020ae46 {
+		t.Fatalf("KVM_SET_USER_MEMORY_REGION=%#x, want %#x", got, uintptr(0x4020ae46))
+	}
+	if got := kvmIOC(iocWrite, kvmSetRegsNR, unsafe.Sizeof(kvmRegs{})); got != 0x4090ae82 {
+		t.Fatalf("KVM_SET_REGS=%#x, want %#x", got, uintptr(0x4090ae82))
+	}
+	if got := kvmIOC(iocRead, kvmGetSregsNR, unsafe.Sizeof(kvmSregs{})); got != 0x8138ae83 {
+		t.Fatalf("KVM_GET_SREGS=%#x, want %#x", got, uintptr(0x8138ae83))
+	}
+	code, err := kvmNPTTouchProgram(7, 123)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(code) != 27 {
+		t.Fatalf("touch program length=%d, want 27", len(code))
+	}
+	if got, want := binary.LittleEndian.Uint32(code[2:6]), uint32(kvmSparseGPA+7*pmdSpan); got != want {
+		t.Fatalf("touch address=%#x, want %#x", got, want)
+	}
+	if got := binary.LittleEndian.Uint32(code[8:12]); got != 123 {
+		t.Fatalf("touch count=%d, want 123", got)
+	}
+	if got := binary.LittleEndian.Uint32(code[18:22]); got != pmdSpan {
+		t.Fatalf("touch stride=%#x, want %#x", got, uint32(pmdSpan))
+	}
+	if code[24] != 0x75 || code[25] != 0xf2 || code[26] != 0xf4 {
+		t.Fatalf("touch loop tail=%x, want 75f2f4", code[24:])
+	}
+}
+
+func TestKVMNPTProbeTouch(t *testing.T) {
+	if os.Getenv("PWNESC_KVM_NPT_TEST") != "1" {
+		t.Skip("set PWNESC_KVM_NPT_TEST=1 in a disposable nested-KVM fixture")
+	}
+	probe, err := prepareKVMNPTProbe(384)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := probe.touch(probe.warmEnd, probe.firstEnd-probe.warmEnd); err != nil {
+		t.Fatal(err)
+	}
+	if err := probe.touch(probe.firstEnd, probe.count-probe.firstEnd); err != nil {
+		t.Fatal(err)
+	}
+	if changed := probe.changedMarkerPages(); len(changed) != 0 {
+		t.Fatalf("nested guest touch changed backing markers at pages %v", changed)
 	}
 }
 

