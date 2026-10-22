@@ -131,3 +131,42 @@ func TestStaleNaturalFragmentGeometry(t *testing.T) {
 		t.Fatalf("padded length=%d, want 33086", got)
 	}
 }
+
+func TestStaleNaturalOverlapGeometry(t *testing.T) {
+	c := cfg{}
+	applyStaleNaturalFrag(&c)
+	middle, head, tail := staleNaturalOverlapFrames(c, ipID+1)
+	if len(middle) != c.staleFragPadLen {
+		t.Fatalf("middle frame length=%d, want %d", len(middle), c.staleFragPadLen)
+	}
+	if len(head) != ethLen+ipLen+8 || len(tail) != ethLen+ipLen+8 {
+		t.Fatalf("completion frame lengths head=%d tail=%d, want %d", len(head), len(tail), ethLen+ipLen+8)
+	}
+	if got := len(middle) - c.staleFragHdrLen; got != 32768 {
+		t.Fatalf("middle nonlinear length=%d, want 32768", got)
+	}
+	middleIP := ipv4Of(middle)
+	tailIP := ipv4Of(tail)
+	if middleIP == nil || tailIP == nil {
+		t.Fatal("overlap frames do not contain IPv4")
+	}
+	middlePayloadLen := int(binary.BigEndian.Uint16(middleIP[2:])) - ipLen
+	tailOffset := int(binary.BigEndian.Uint16(tailIP[6:])&0x1fff) * 8
+	if middlePayloadLen != 32776 || tailOffset != 32784 {
+		t.Fatalf("middle payload=%d tail offset=%d, want 32776 and 32784", middlePayloadLen, tailOffset)
+	}
+}
+
+func TestIPv4PayloadWindow(t *testing.T) {
+	id := uint16(ipID + 2)
+	payload := bytesRepeat(64, 0x72)
+	copy(payload[23:31], []byte("OVERLAP"))
+	pkts := [][]byte{
+		ipv4PacketWithOptions(32, false, payload[32:], id, nil),
+		ipv4PacketWithOptions(0, true, payload[:32], id, nil),
+	}
+	got, ok := ipv4PayloadWindow(pkts, 23, len("OVERLAP"))
+	if !ok || string(got) != "OVERLAP" {
+		t.Fatalf("window ok=%t got=%q", ok, got)
+	}
+}

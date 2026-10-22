@@ -51,6 +51,23 @@ func TestEgressDoubleVLANFrame(t *testing.T) {
 	}
 }
 
+func TestEgressUntaggedFrame(t *testing.T) {
+	srcMAC, _ := net.ParseMAC("02:00:00:00:00:01")
+	dstMAC, _ := net.ParseMAC("02:00:00:00:00:02")
+	ip := egressFragment(0, true, bytesRepeat(8, marker), ipID,
+		net.ParseIP("192.0.2.2"), net.ParseIP("198.51.100.7"))
+	frame := egressFrameWithoutVLAN(ip, srcMAC, dstMAC)
+	if len(frame) != ethLen+len(ip) {
+		t.Fatalf("untagged frame length=%d, want %d", len(frame), ethLen+len(ip))
+	}
+	if got := binary.BigEndian.Uint16(frame[12:]); got != ipProtoEth {
+		t.Fatalf("untagged ethertype=%#04x, want %#04x", got, ipProtoEth)
+	}
+	if frame[ethLen] != 0x45 {
+		t.Fatalf("untagged IPv4 starts with %#02x", frame[ethLen])
+	}
+}
+
 func TestEgressSprayFrame(t *testing.T) {
 	src, _ := net.ParseMAC("02:00:00:00:00:01")
 	dst, _ := net.ParseMAC("02:00:00:00:00:02")

