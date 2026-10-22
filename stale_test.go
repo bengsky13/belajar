@@ -247,6 +247,23 @@ func TestPacketRingOrderZeroRequest(t *testing.T) {
 	}
 }
 
+func TestSparsePTEFirstOffset(t *testing.T) {
+	for base, want := range map[uintptr]int{
+		0:        0,
+		0x1000:   0x1ff000,
+		0x1ff000: 0x1000,
+		0x200000: 0,
+	} {
+		if got := sparsePTEFirstOffset(base); got != want {
+			t.Errorf("base=%#x offset=%#x, want %#x", base, got, want)
+		}
+	}
+	const pte = uint64(0x8000000012345067)
+	if got := pte & x86PTEAddressMask; got != 0x12345000 {
+		t.Fatalf("PTE physical address=%#x, want %#x", got, uint64(0x12345000))
+	}
+}
+
 func TestIPv4PayloadWindow(t *testing.T) {
 	id := uint16(ipID + 2)
 	payload := bytesRepeat(64, 0x72)

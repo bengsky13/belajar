@@ -303,10 +303,48 @@ bug, warning, bad-page, and refcount diagnostics through shutdown.
 
 This proves an order-3-to-order-0 UNMOVABLE transition and controlled read of
 the replacement kernel page. It is not host command execution. The remaining
-host-escape step is to replace the packet-ring owner with a useful host KVM
-allocation (most notably an EPT/NPT page-table page), identify the reclaimed
-page's role, and turn the stale read/release into controlled host translation
-or control flow.
+host-escape step is to reproduce the page-table takeover below against a useful
+host KVM allocation (most notably an EPT/NPT page-table page), identify the
+reclaimed page's role, and turn it into controlled host translation or control
+flow.
+
+The same order-0 path also reclaims the freed page as a live process PTE page,
+then frees it a second time through the stale anchor and reclaims it through a
+packet ring. This is deliberately destructive and must run only in a disposable
+VM that is powered off while the process is held:
+
+```sh
+./test -stale-options-write -stale-natural-frag \
+  -stale-natural-overlap -stale-overlap-local-reassembly \
+  -stale-local-rollover 10 -stale-local-single-ref \
+  -stale-single-ref-anchors 8 \
+  -stale-single-ref-pcp-prime 1600 \
+  -stale-single-ref-pcp-wait-ms 2000 \
+  -stale-single-ref-pte -stale-single-ref-pte-count 8192 \
+  -stale-single-ref-pte-takeover \
+  -stale-single-ref-ring-size $((64 << 20)) \
+  -stale-single-ref-hold-ms 300000 -capture-ms 100
+```
+
+The sparse mapping faults one 4 KiB page in each aligned 2 MiB region, forcing
+one distinct PTE page per region. Root-readable pagemap PFNs let the stale
+32-byte disclosure identify an installed PTE without guessing. In the verified
+Alpine 6.18.52 run, anchor zero disclosed PTE `0x80000000074b1867`, pointing to
+physical page `0x74b1000` for sparse region 401. Completing that anchor dropped
+the PTE page's live reference and returned it to the allocator. A 64 MiB
+order-0 packet ring reclaimed the page and filled every entry with the disclosed
+valid PTE. The formerly unmapped next virtual page then read the original
+page's `0xc7` marker, and writing `0x4d` through that alias changed the original
+mapping to `0x4d`.
+
+That is a controlled writable page-table takeover in the guest lab, not merely
+a disclosure. The process was held after verification, live `dmesg` was empty,
+and the VM was force-powered-off before address-space teardown. An earlier
+diagnostic run that allowed the process to exit produced the expected
+`BUG: Bad page map` reports, independently confirming that the stale release
+had freed a still-installed PTE page. This still is not host command execution:
+the target Firecracker host requires the analogous overlap with its second-level
+KVM page tables, which cannot be exercised by this userspace-only guest fixture.
 
 The egress form briefly raises the guest interface MTU to 65535, sends the
 jumbo descriptor seed followed by MTU-safe completing fragments, and restores
